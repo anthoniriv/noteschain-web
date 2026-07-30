@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>NotesChain</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9B%93%3C/text%3E%3C/svg%3E" />
 <style>
@@ -18,7 +18,7 @@
     font-family: "SF Mono", ui-monospace, Menlo, monospace;
     overflow: hidden;
   }
-  #brain { position: fixed; inset: 0; z-index: 0; display: block; cursor: grab; width: 100vw; height: 100vh; }
+  #brain { position: fixed; inset: 0; z-index: 0; display: block; cursor: grab; width: 100vw; height: 100vh; touch-action: none; }
   #brain.dragging { cursor: grabbing; }
 
   /* ---- barra superior mínima ---- */
@@ -151,10 +151,23 @@
   .chip.pulse .dot { animation: dotpulse 1s infinite; }
   @keyframes dotpulse { 0%,100% { opacity: .15; } 50% { opacity: 1; } }
 
-  #add {
-    position: fixed; right: 1.4rem; bottom: 1.4rem; z-index: 5;
+  .fab {
+    position: fixed; right: 1.4rem; z-index: 5;
     width: 3rem; height: 3rem; font-size: 1.3rem; padding: 0;
     border-radius: 50%;
+  }
+  #add { bottom: 1.4rem; }
+  #paste { bottom: 5rem; }
+  #find { bottom: 8.6rem; }
+  #m-view a { color: inherit; text-decoration: underline; word-break: break-all; }
+
+  @media (max-width: 640px) {
+    #topbar { flex-wrap: wrap; gap: .3rem .8rem; font-size: .56rem; padding: .6rem .8rem; }
+    #chips { top: 4.6rem; }
+    .ncard { width: 116px; }
+    .ncard p { font-size: .55rem; }
+    #spot { padding-top: 10vh; }
+    #log { max-width: 60vw; }
   }
   #log {
     position: fixed; left: 1rem; bottom: 1rem; z-index: 4;
@@ -193,7 +206,9 @@
 
 <div id="chips"></div>
 
-<button id="add" hidden>+</button>
+<button id="find" class="fab ghost" hidden title="buscar (⌘F)">⌕</button>
+<button id="paste" class="fab ghost" hidden title="pegar portapapeles">⧉</button>
+<button id="add" class="fab" hidden>+</button>
 
 <div id="modal" hidden>
   <div class="sheet">
@@ -563,7 +578,8 @@ async function refresh(dataChanged) {
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
   $('role').textContent = meta.role === 'owner' ? 'owner' : 'lector';
-  $('add').hidden = meta.role !== 'owner';
+  $('add').hidden = $('paste').hidden = meta.role !== 'owner';
+  $('find').hidden = false;
   $('share').hidden = false;
   updateNet();
 }
@@ -603,11 +619,26 @@ function syncCards() {
 /* ---------- modal ver/editar ---------- */
 let editingId = null;
 let pendingImage = null;
+// URLs del contenido → enlaces clickeables (sin innerHTML: a prueba de inyección)
+function renderContentWithLinks(el, text) {
+  el.textContent = '';
+  const re = /https?:\/\/[^\s]+/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    el.append(text.slice(last, m.index));
+    const a = document.createElement('a');
+    a.href = m[0]; a.textContent = m[0]; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    el.append(a);
+    last = m.index + m[0].length;
+  }
+  el.append(text.slice(last));
+}
+
 function openView(id) {
   const n = notes.find((x) => x.id === id); if (!n) return;
   $('modal').hidden = false; $('m-view').hidden = false; $('m-edit').hidden = true;
   $('v-title').textContent = n.title || '(sin título)';
-  $('v-content').textContent = n.content ?? '';
+  renderContentWithLinks($('v-content'), n.content ?? '');
   $('v-date').textContent = new Date(n.updatedAt).toLocaleString();
   $('v-img').innerHTML = '';
   if (n.image) { const img = document.createElement('img'); img.src = n.image; $('v-img').append(img); }
@@ -671,6 +702,12 @@ function resizeImage(file, max) {
 }
 
 // ⌘V / Ctrl+V FUERA del editor → crea la nota directamente (texto o imagen)
+const noteFromText = (text) => ({ title: text.trim().split('\n')[0].slice(0, 48), content: text, image: null });
+async function createNote(data) {
+  await appendOp('NOTE_ADD', { noteId: crypto.randomUUID(), enc: await Security.encrypt(data) });
+  log('nota creada — nueva neurona');
+}
+
 let lastPaste = { sig: '', ts: 0 };
 window.addEventListener('paste', async (e) => {
   if (!meta || meta.role !== 'owner') return;
@@ -680,18 +717,38 @@ window.addEventListener('paste', async (e) => {
   if (sig === lastPaste.sig && Date.now() - lastPaste.ts < 3000) return;
   lastPaste = { sig, ts: Date.now() };
   const imgItem = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith('image/'));
-  let data = null;
   if (imgItem) {
-    data = { title: 'Imagen ' + new Date().toLocaleTimeString(), content: '', image: await resizeImage(imgItem.getAsFile(), 900) };
+    await createNote({ title: 'Imagen ' + new Date().toLocaleTimeString(), content: '', image: await resizeImage(imgItem.getAsFile(), 900) });
   } else {
     const text = e.clipboardData?.getData('text') ?? '';
     if (!text.trim()) return;
-    const firstLine = text.trim().split('\n')[0].slice(0, 48);
-    data = { title: firstLine, content: text, image: null };
+    await createNote(noteFromText(text));
   }
-  await appendOp('NOTE_ADD', { noteId: crypto.randomUUID(), enc: await Security.encrypt(data) });
-  log('nota creada al pegar — nueva neurona');
 });
+
+// botón pegar (móvil no tiene ⌘V global): lee el portapapeles con permiso del usuario
+$('paste').onclick = async () => {
+  try {
+    if (navigator.clipboard.read) {
+      try {
+        for (const item of await navigator.clipboard.read()) {
+          const imgType = item.types.find((t) => t.startsWith('image/'));
+          if (imgType) {
+            const blob = await item.getType(imgType);
+            return createNote({ title: 'Imagen ' + new Date().toLocaleTimeString(), content: '', image: await resizeImage(blob, 900) });
+          }
+        }
+      } catch {} // sin imagen o sin permiso de read(): probar texto
+    }
+    const text = await navigator.clipboard.readText();
+    if (!text.trim()) return log('portapapeles vacío');
+    await createNote(noteFromText(text));
+  } catch {
+    log('permiso de portapapeles denegado — permítelo en el navegador');
+  }
+};
+
+$('find').onclick = () => openSpot();
 
 /* ---------- spotlight (⌘F / Ctrl+F / ⌘K) ---------- */
 let spotSel = 0, spotHits = [];
@@ -812,16 +869,42 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
     camera.position.set(radius * Math.sin(phi) * Math.sin(theta), radius * Math.cos(phi), radius * Math.sin(phi) * Math.cos(theta));
     camera.lookAt(0, 0, 0);
   }
+  // 1 dedo/mouse: rotar · 2 dedos: pinch-zoom del cerebro (no de la página) · rueda: zoom
   let dragging = false, px = 0, py = 0;
-  canvas.addEventListener('pointerdown', (e) => { dragging = true; px = e.clientX; py = e.clientY; canvas.classList.add('dragging'); targetTheta = targetPhi = null; });
-  addEventListener('pointerup', () => { dragging = false; canvas.classList.remove('dragging'); });
+  const touchPts = new Map();
+  let pinchBase = 0, radiusBase = 0;
+  const clampR = (r) => Math.min(11, Math.max(3.2, r));
+  canvas.addEventListener('pointerdown', (e) => {
+    touchPts.set(e.pointerId, [e.clientX, e.clientY]);
+    if (touchPts.size === 1) { dragging = true; px = e.clientX; py = e.clientY; canvas.classList.add('dragging'); targetTheta = targetPhi = null; }
+    else if (touchPts.size === 2) {
+      dragging = false;
+      const [a, b] = [...touchPts.values()];
+      pinchBase = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      radiusBase = radius;
+    }
+  });
+  const endPointer = (e) => {
+    touchPts.delete(e.pointerId);
+    if (touchPts.size === 1) { const p = [...touchPts.values()][0]; px = p[0]; py = p[1]; dragging = true; }
+    else { dragging = false; canvas.classList.remove('dragging'); }
+  };
+  addEventListener('pointerup', endPointer);
+  addEventListener('pointercancel', endPointer);
   addEventListener('pointermove', (e) => {
+    if (touchPts.has(e.pointerId)) touchPts.set(e.pointerId, [e.clientX, e.clientY]);
+    if (touchPts.size === 2) {
+      const [a, b] = [...touchPts.values()];
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      if (pinchBase > 0) radius = clampR(radiusBase * (pinchBase / d));
+      return;
+    }
     if (!dragging) return;
     vTheta = (e.clientX - px) * 0.006; vPhi = (e.clientY - py) * 0.006;
     theta -= vTheta; phi = Math.min(2.6, Math.max(0.5, phi - vPhi));
     px = e.clientX; py = e.clientY;
   });
-  canvas.addEventListener('wheel', (e) => { e.preventDefault(); radius = Math.min(11, Math.max(3.2, radius + e.deltaY * 0.005)); }, { passive: false });
+  canvas.addEventListener('wheel', (e) => { e.preventDefault(); radius = clampR(radius + e.deltaY * 0.005); }, { passive: false });
 
   // mini cerebro 3D central: compacto, denso, girando sobre su propio eje
   // (punto de partida de todas las ramas — como un cerebro en rotación continua)
@@ -936,16 +1019,12 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   (function animate() {
     requestAnimationFrame(animate);
     const t = clock.getElapsedTime();
-    if (!dragging) {
-      if (targetTheta !== null) { // animación hacia la neurona buscada
-        theta += (targetTheta - theta) * 0.08;
-        phi += (targetPhi - phi) * 0.08;
-        if (Math.abs(targetTheta - theta) < 0.01 && Math.abs(targetPhi - phi) < 0.01) targetTheta = targetPhi = null;
-      } else {
-        theta += 0.0012; // deriva lenta
-        theta += vTheta * -1 * 0.0; // (inercia simple ya aplicada en drag)
-      }
+    if (!dragging && targetTheta !== null) { // animación hacia la neurona buscada
+      theta += (targetTheta - theta) * 0.08;
+      phi += (targetPhi - phi) * 0.08;
+      if (Math.abs(targetTheta - theta) < 0.01 && Math.abs(targetPhi - phi) < 0.01) targetTheta = targetPhi = null;
     }
+    // sin deriva automática: el cerebro solo se mueve cuando TÚ lo mueves
     placeCamera();
     coreGroup.rotation.y = t * 0.55; // el mini cerebro gira solo, continuo
     // chispas
@@ -967,7 +1046,9 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
     projectCards();
   })();
 
-  function simpleFallback() {} // three cargó: no-op
+  // el cerebro cargó DESPUÉS de enterMain: dibujar las notas que ya existían
+  // (sin esto, tras un hard refresh no se veía nada hasta el siguiente cambio)
+  Brain.setNotes(notes);
 })();
 
 // fallback sin three.js: lista plana de cards en grid
