@@ -68,6 +68,9 @@
   }
   #setup h2 { font-size: .78rem; letter-spacing: .18em; text-transform: uppercase; margin-bottom: .6rem; }
   #setup p { font-size: .72rem; color: var(--dim); line-height: 1.6; margin-bottom: 1rem; }
+  #remember-row { display: flex; align-items: center; gap: .5rem; font-size: .72rem; margin-bottom: .4rem; cursor: pointer; }
+  #remember-row input { width: auto; margin: 0; accent-color: var(--ink); }
+  #setup .hint { font-size: .62rem; margin-bottom: .8rem; }
 
   /* ---- cards de nota (proyectadas sobre el cerebro) ---- */
   .ncard {
@@ -201,6 +204,8 @@
     <h2>Conectar con enlace secreto</h2>
     <p>Pega el enlace o código que compartió el owner (contiene la llave de cifrado). Este dispositivo replica, verifica y descifra — solo lectura.</p>
     <input id="join-code" placeholder="enlace o código secreto" spellcheck="false" />
+    <label id="remember-row"><input type="checkbox" id="remember" /> recordar en este dispositivo</label>
+    <p class="hint">Sin marcar: al cerrar la pestaña este dispositivo olvida todo (nada se guarda en disco). Márcalo solo en dispositivos tuyos.</p>
     <button id="btn-join" class="ghost">conectar</button>
   </div>
 </div>
@@ -346,7 +351,14 @@ function idb() {
 }
 const dbGet = async (s, k) => { const d = await idb(); return new Promise((res, rej) => { const r = d.transaction(s).objectStore(s).get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); };
 const dbAll = async () => { const d = await idb(); return new Promise((res, rej) => { const r = d.transaction('blocks').objectStore('blocks').getAll(); r.onsuccess = () => res(r.result.sort((a, b) => a.index - b.index)); r.onerror = () => rej(r.error); }); };
-const dbWrite = async (fn) => { const d = await idb(); return new Promise((res, rej) => { const tx = d.transaction(['blocks', 'meta'], 'readwrite'); fn(tx); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
+// PERSIST=false (invitado sin "recordar"): NADA toca el disco — réplica y
+// llaves viven solo en memoria y mueren al cerrar la pestaña.
+let PERSIST = true;
+const dbWrite = async (fn) => {
+  if (!PERSIST) return;
+  const d = await idb();
+  return new Promise((res, rej) => { const tx = d.transaction(['blocks', 'meta'], 'readwrite'); fn(tx); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+};
 
 /* ---------- estado ---------- */
 let blocks = [], meta = null, peers = new Map();
@@ -851,16 +863,18 @@ $('btn-join').onclick = async () => {
   const raw = $('join-code').value.trim();
   const m = raw.match(/([0-9a-f]{64})\.([0-9a-f]{64})/i);
   if (!m) return log('código inválido — pide al owner su "enlace secreto"');
+  PERSIST = $('remember').checked; // invitados: sin marcar, sesión efímera
   meta = { role: 'reader', chainId: m[1].toLowerCase(), encKey: m[2].toLowerCase() };
   await dbWrite((tx) => tx.objectStore('meta').put(meta, 'meta'));
-  log('buscando el cerebro en la red…');
+  log(PERSIST ? 'buscando el cerebro en la red…' : 'sesión efímera — al cerrar la pestaña se olvida todo');
   enterMain();
 };
 (async () => {
   meta = await dbGet('meta', 'meta');
   if (meta) { blocks = await dbAll(); enterMain(); return; }
   const m = location.hash.slice(1).match(/([0-9a-f]{64})\.([0-9a-f]{64})/i);
-  if (m) { $('join-code').value = m[0]; history.replaceState(null, '', location.pathname); $('btn-join').click(); }
+  // enlace compartido: prellenar y dejar que la persona DECIDA si recordar
+  if (m) { $('join-code').value = m[0]; history.replaceState(null, '', location.pathname); $('join-code').scrollIntoView(); }
 })();
 
 /* ============================================================
