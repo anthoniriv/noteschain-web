@@ -493,7 +493,7 @@ function chip(id, text, pulse) {
   }
   el.className = 'chip' + (pulse ? ' pulse' : '');
   el.querySelector('.txt').textContent = text;
-  if (pulse) setTimeout(() => { if (el.classList.contains('pulse')) el.remove(); }, 45_000); // intento fallido: no dejar el chip colgado
+  if (pulse) setTimeout(() => { if (el.classList.contains('pulse')) el.remove(); }, 20_000); // intento fallido: no dejar el chip colgado
 }
 const dropChip = (id) => document.querySelector(`[data-chip="${id}"]`)?.remove();
 const dropPairingChips = () => document.querySelectorAll('[data-chip^="pair-"]').forEach((e) => e.remove());
@@ -502,7 +502,10 @@ const selfHex = bytesHex(crypto.getRandomValues(new Uint8Array(8)));
 function wire(pc, dc) {
   let key = null; // se fija con el HELLO (id real del peer → dedup de conexiones dobles)
   dc.onopen = () => dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex }));
-  dc.onclose = () => { if (key) { peers.delete(key); dropChip(key); refresh(); } };
+  const gone = () => { if (key && peers.get(key)?.dc === dc) { peers.delete(key); dropChip(key); refresh(); } };
+  dc.onclose = gone;
+  // canal caído sin evento close limpio (iOS suspendido, red cortada)
+  pc.onconnectionstatechange = () => { if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) gone(); };
   dc.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.t === 'HELLO') {
@@ -511,9 +514,13 @@ function wire(pc, dc) {
         if (m.height > blocks.length) dc.send(JSON.stringify({ t: 'GET_BLOCKS' }));
         return;
       }
-      if (id === selfHex || peers.has(id)) {
-        try { dc.close(); pc.close(); } catch {} // duplicado o eco: una sinapsis por dispositivo
-        return;
+      if (id === selfHex) { try { dc.close(); pc.close(); } catch {} return; } // eco de uno mismo
+      const existing = peers.get(id);
+      if (existing && existing.dc !== dc) {
+        // mismo dispositivo reconectando (p.ej. iOS tras suspender la pestaña):
+        // la sinapsis NUEVA sustituye a la vieja — el fantasma muere, no la nueva
+        try { existing.dc.close(); existing.pc.close(); } catch {}
+        peers.delete(id);
       }
       key = id;
       peers.set(key, { pc, dc });
@@ -533,6 +540,7 @@ function wire(pc, dc) {
 // pide la cadena. También delata canales muertos (el send falla → se limpia).
 setInterval(() => {
   for (const [id, p] of peers) {
+    if (p.dc.readyState !== 'open') { peers.delete(id); dropChip(id); refresh(); continue; }
     try { p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex })); }
     catch { peers.delete(id); dropChip(id); refresh(); }
   }
@@ -658,9 +666,14 @@ function resizeImage(file, max) {
 }
 
 // ⌘V / Ctrl+V FUERA del editor → crea la nota directamente (texto o imagen)
+let lastPaste = { sig: '', ts: 0 };
 window.addEventListener('paste', async (e) => {
   if (!meta || meta.role !== 'owner') return;
   if (!$('modal').hidden || !$('spot').hidden || !$('setup').hidden) return; // dentro de un editor: pegado nativo
+  // anti-duplicado: mismo contenido en <3s = un solo ⌘V (algunos navegadores disparan doble)
+  const sig = e.clipboardData?.getData('text') || 'img';
+  if (sig === lastPaste.sig && Date.now() - lastPaste.ts < 3000) return;
+  lastPaste = { sig, ts: Date.now() };
   const imgItem = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith('image/'));
   let data = null;
   if (imgItem) {
@@ -873,11 +886,12 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
 
   // electricidad: chispas viajando del núcleo a cada neurona
   let sparkGeo = null, sparkPts = null, sparks = [];
-  const sparkMat = new T.PointsMaterial({ color: ink, size: 0.055, transparent: true, opacity: 0.9 });
+  const sparkMat = new T.PointsMaterial({ color: ink, size: 0.038, transparent: true, opacity: 0.8 });
   function rebuildSparks() {
     if (sparkPts) scene.remove(sparkPts);
     sparks = [];
-    const per = branches.length ? Math.max(1, Math.floor(26 / branches.length)) : 0;
+    // máx 2 chispas por rama: más de eso se apelotona y parece neuronas sueltas
+    const per = branches.length ? Math.min(2, Math.max(1, Math.floor(12 / branches.length))) : 0;
     // pálpito: la chispa va del cerebro a la neurona y VUELVE, lenta
     for (const b of branches) for (let k = 0; k < per; k++) sparks.push({ curve: b.curve, t: Math.random(), v: 0.0022 + Math.random() * 0.0028, dir: Math.random() < 0.5 ? 1 : -1 });
     sparkGeo = new T.BufferGeometry();
