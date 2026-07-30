@@ -260,9 +260,40 @@
     #spot { padding-top: 10vh; }
     #log { max-width: 60vw; }
   }
+  /* avisos: legibles y en pantalla, no una línea cortada abajo */
+  #toasts {
+    position: fixed; top: 3.4rem; left: 50%; transform: translateX(-50%);
+    z-index: 70; width: min(420px, 92vw);
+    display: flex; flex-direction: column; gap: .4rem;
+    pointer-events: none;
+  }
+  .toast {
+    background: var(--bg); border: 1px solid var(--ink);
+    box-shadow: 5px 5px 0 var(--ink);
+    padding: .6rem .7rem;
+    font-size: .68rem; line-height: 1.5;
+    animation: toastin .2s cubic-bezier(.2,1.4,.4,1);
+  }
+  .toast.err {
+    border-color: #d00020; color: #d00020;
+    box-shadow: 5px 5px 0 #d00020;
+    font-weight: 700;
+  }
+  .toast.out { opacity: 0; transition: opacity .4s; }
+  @keyframes toastin { from { transform: translateY(-8px); opacity: 0; } }
+
+  /* sacudida en el dispositivo que intentó la acción fallida */
+  @keyframes shake {
+    10%, 90% { transform: translateX(-2px); }
+    20%, 80% { transform: translateX(4px); }
+    30%, 50%, 70% { transform: translateX(-7px); }
+    40%, 60% { transform: translateX(7px); }
+  }
+  .shaking { animation: shake .5s cubic-bezier(.36,.07,.19,.97) both; }
+
   #log {
     position: fixed; left: 1rem; bottom: 1rem; z-index: 4;
-    font-size: .6rem; color: var(--dim); max-width: 55vw;
+    font-size: .6rem; color: var(--dim); max-width: 80vw;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     pointer-events: none;
   }
@@ -322,7 +353,7 @@
       <input id="e-title" placeholder="título" />
       <textarea id="e-content" placeholder="escribe o pega tu nota… (⌘V / Ctrl+V — también imágenes)" rows="8"></textarea>
       <div id="e-img"></div>
-      <p id="paste-hint">⌘V / Ctrl+V pega texto, imágenes o archivos. También puedes arrastrarlos aquí. Para código usa ```lenguaje … ``` — todo se cifra antes de salir del dispositivo.</p>
+      <p id="paste-hint">⌘V / Ctrl+V pega texto, imágenes o archivos. También puedes arrastrarlos aquí. Para código usa ```lenguaje … ``` — todo se cifra antes de salir del dispositivo. Máximo 60 MB por archivo.</p>
       <input type="file" id="e-file" multiple hidden />
       <!-- accept de galería: en iOS/Android abre fotos y vídeos con selección múltiple -->
       <input type="file" id="e-media" multiple accept="image/*,video/*" hidden />
@@ -365,6 +396,8 @@
   <button id="dead-ok">entendido</button>
 </div>
 
+<div id="toasts"></div>
+
 <div id="log"></div>
 
 <script type="module">
@@ -379,6 +412,31 @@
    ============================================================ */
 const $ = (id) => document.getElementById(id);
 const log = (m) => { $('log').textContent = m; console.log('[noteschain]', m); };
+
+// Aviso visible en pantalla (la línea de abajo se corta en móvil). Los errores
+// salen en rojo, sacuden el dispositivo y vibran si el móvil lo permite.
+function toast(msg, isError = false, ms = isError ? 6000 : 3000) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (isError ? ' err' : '');
+  el.textContent = msg;
+  $('toasts').append(el);
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 400); }, ms);
+  console[isError ? 'warn' : 'log']('[noteschain]', msg);
+  if (isError) shake();
+}
+function shake() {
+  // sacude lo que el usuario esté mirando (editor/diálogo o la app entera)
+  const target = !$('modal').hidden ? $('modal').firstElementChild
+    : !$('ask').hidden ? $('ask').firstElementChild
+    : document.getElementById('topbar');
+  if (!target) return;
+  target.classList.remove('shaking');
+  void target.offsetWidth; // reiniciar la animación
+  target.classList.add('shaking');
+  setTimeout(() => target.classList.remove('shaking'), 600);
+  navigator.vibrate?.([40, 60, 40]);
+}
+const fail = (msg) => toast(msg, true);
 
 // Diálogo propio en la línea gráfica (nada de confirm() del navegador).
 // Devuelve el `value` de la opción elegida, o null si se cancela.
@@ -634,11 +692,31 @@ const hasBlob = async (hash) => Boolean(await getBlobRec(hash));
 
 // Archivo del usuario → blob cifrado + descriptor para la nota
 async function ingestFile(file) {
-  if (file.size > MAX_FILE) { log(`"${file.name}" supera 25 MB — no añadido`); return null; }
-  const buf = await file.arrayBuffer();
-  const hash = await bufHashHex(buf);
-  if (!(await hasBlob(hash))) await putBlob(hash, await encryptBytes(buf));
-  return { name: file.name || 'archivo', type: file.type || 'application/octet-stream', size: file.size, hash };
+  if (file.size > MAX_FILE) {
+    fail(`"${file.name}" pesa ${prettySize(file.size)} y el máximo es ${prettySize(MAX_FILE)}. No se añadió.`);
+    return null;
+  }
+  // ¿cabe en el almacenamiento del navegador? (iOS es el más estrecho)
+  try {
+    const est = await navigator.storage?.estimate?.();
+    if (est?.quota && est.usage + file.size * 1.4 > est.quota) {
+      fail(`No cabe "${file.name}": quedan ~${prettySize(Math.max(0, est.quota - est.usage))} en este dispositivo.`);
+      return null;
+    }
+  } catch {}
+  try {
+    const buf = await file.arrayBuffer();
+    const hash = await bufHashHex(buf);
+    if (!(await hasBlob(hash))) await putBlob(hash, await encryptBytes(buf));
+    return { name: file.name || 'archivo', type: file.type || 'application/octet-stream', size: file.size, hash };
+  } catch (e) {
+    // sin espacio en el navegador, o el archivo no cabe en memoria
+    const sinEspacio = /quota|storage|space/i.test(e?.name + e?.message);
+    fail(sinEspacio
+      ? `No hay espacio en este dispositivo para "${file.name}". Libera espacio o borra notas con archivos grandes.`
+      : `No se pudo procesar "${file.name}" (${prettySize(file.size)}). Puede ser demasiado grande para este dispositivo.`);
+    return null;
+  }
 }
 
 // URL utilizable (blob:) para mostrar o descargar; null si aún no llegó
@@ -701,7 +779,7 @@ async function adoptChain(cand) {
   const better = cand.length > blocks.length || (cand.length === blocks.length && mine && theirs.hash < mine.hash);
   if (!better) return;
   const err = await verifyChain(cand, meta.chainId);
-  if (err) return log(`cadena rechazada: ${err}`);
+  if (err) return fail(`Cadena rechazada: ${err}`);
   // mis operaciones que la otra rama no tiene: se reaplican después (rebase),
   // así una edición simultánea no se pierde en silencio
   const theirHashes = new Set(cand.map((b) => b.hash));
@@ -725,7 +803,7 @@ async function receiveBlock(block, from) {
   if (blocks[block.index]?.hash === block.hash) return; // ya lo tenemos (eco de gossip)
   if (!owner || !tip || block.index !== tip.index + 1) return from?.send(JSON.stringify({ t: 'GET_BLOCKS' }));
   const err = await verifyBlock(block, tip, owner, writersOf(blocks));
-  if (err) return log(`bloque rechazado: ${err}`);
+  if (err) return fail(`Bloque rechazado: ${err}`);
   blocks.push(block);
   await dbWrite((tx) => tx.objectStore('blocks').put(block));
   for (const p of peers.values()) if (p.dc !== from && p.dc?.readyState === 'open') p.dc.send(JSON.stringify({ t: 'NEW_BLOCK', block }));
@@ -861,7 +939,7 @@ async function onAuthChallenge(dc, m) {
 
 async function onAuthProof(m) {
   if (meta.role !== 'owner') return;
-  if (pendingAuth.get(m.pub) !== m.nonce) return log('dispositivo rechazado: prueba inválida');
+  if (pendingAuth.get(m.pub) !== m.nonce) return fail(`Dispositivo ${m.pub.slice(0,6)} rechazado: no superó la prueba de la llave.`);
   pendingAuth.delete(m.pub);
   if (writersOf(blocks).has(m.pub)) return;
   await appendOp('DEVICE_ADD', { pubKey: m.pub });
@@ -935,13 +1013,13 @@ async function onBlobChunk(m) {
   const rec = { iv: unb64(st.iv), ct: ct.buffer };
   try {
     const plain = await decryptBytes(rec);
-    if ((await bufHashHex(plain)) !== m.hash) return log('archivo descartado: hash no coincide');
+    if ((await bufHashHex(plain)) !== m.hash) return fail('Archivo descartado: no coincide con su huella. Puede estar corrupto o manipulado.');
     await putBlob(m.hash, rec);
     asking.delete(m.hash);
     urlCache.delete(m.hash);
-    log('archivo recibido y verificado');
+    toast('Archivo recibido y verificado.');
     renderAll();
-  } catch { log('archivo descartado: no se pudo descifrar'); }
+  } catch { fail('Archivo descartado: no se pudo descifrar con la llave de este cerebro.'); }
 }
 
 /* ---------- P2P (trackers WebTorrent, solo señalización) ---------- */
@@ -1145,7 +1223,7 @@ function wire(pc, dc) {
       const owner = blocks[0]?.payload.ownerPubKey;
       enqueue(async () => {
         if (owner && (await verifyDestroy(m.block, owner))) { log('sentencia de muerte verificada'); brainDeath(); }
-        else log('sentencia de muerte inválida — ignorada');
+        else fail('Llegó una orden de destrucción con firma inválida: ignorada.');
       });
     } else if (m.t === 'GET_BLOCKS') {
       if (tombstone) { try { dc.send(JSON.stringify({ t: 'DESTROYED', block: tombstone.block })); } catch {} return; }
@@ -1405,7 +1483,7 @@ async function attachFiles(fileList) {
     if (desc && !pendingFiles.some((f) => f.hash === desc.hash)) pendingFiles.push(desc);
     renderPendingImg(); // ir mostrando lo ya cifrado
   }
-  if (files.length > 1) log(`${files.length} archivos listos`);
+  if (files.length > 1) toast(`${files.length} archivos listos y cifrados.`);
 }
 
 $('e-attach').onclick = () => $('e-file').click();
@@ -1450,7 +1528,7 @@ addEventListener('drop', async (e) => {
 const noteFromText = (text) => ({ title: text.trim().split('\n')[0].slice(0, 48), content: text, image: null, files: [] });
 async function createNote(data) {
   // jamás crear neuronas vacías (pegados fallidos, portapapeles raro)
-  if (!data.title?.trim() && !data.content?.trim() && !data.image && !data.files?.length) return log('nada que pegar — nota no creada');
+  if (!data.title?.trim() && !data.content?.trim() && !data.image && !data.files?.length) return toast('No había nada que pegar: nota no creada.');
   await appendOp('NOTE_ADD', { noteId: crypto.randomUUID(), enc: await Security.encrypt(data) });
   log('nota creada — nueva neurona');
 }
@@ -1494,10 +1572,10 @@ $('paste').onclick = async () => {
       } catch {} // sin imagen o sin permiso de read(): probar texto
     }
     const text = await navigator.clipboard.readText();
-    if (!text.trim()) return log('portapapeles vacío');
+    if (!text.trim()) return toast('El portapapeles está vacío.');
     await createNote(noteFromText(text));
   } catch {
-    log('permiso de portapapeles denegado — permítelo en el navegador');
+    fail('El navegador no dejó leer el portapapeles. Permite el acceso o pega con ⌘V/Ctrl+V.');
   }
 };
 
@@ -1737,7 +1815,7 @@ $('btn-create').onclick = async () => {
 $('btn-join').onclick = async () => {
   const raw = $('join-code').value.trim();
   const m = raw.match(/([0-9a-f]{64})\.([0-9a-f]{64})(\.d)?/i);
-  if (!m) return log('código inválido — pide al owner su "enlace secreto"');
+  if (!m) return fail('Código inválido. Pide al owner su “enlace secreto”.');
   const own = Boolean(m[3]); // sufijo .d: el owner marcó este enlace como "mi dispositivo"
   PERSIST = own;
   meta = { role: 'reader', chainId: m[1].toLowerCase(), encKey: m[2].toLowerCase(), device: own };
