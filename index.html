@@ -188,6 +188,7 @@
   <span>sinapsis <b id="peers">0</b></span>
   <span id="net">—</span>
   <button id="share" class="ghost" hidden>enlace secreto</button>
+  <button id="forget" class="ghost" hidden>salir</button>
 </div>
 
 <div id="setup">
@@ -453,8 +454,10 @@ function cleanPending(maxAgeMs = 90_000) {
 async function announce(ws) {
   if (ws.readyState !== WebSocket.OPEN) return;
   cleanPending(); // ofertas viejas no consumidas → cerrar (evita fugar PeerConnections)
-  // sin sinapsis: muchas ofertas listas (emparejar rápido); con sinapsis: pocas
-  const want = Math.min(peers.size > 0 ? 1 : 5, Math.max(0, 12 - pending.size));
+  // Con sinapsis activa NO ofrecemos: un dispositivo nuevo siempre trae sus
+  // propias ofertas y nosotros respondemos. Ofrecer estando emparejado creaba
+  // canales duplicados en bucle ("emparejando…" fantasma cada 48s).
+  const want = Math.min(peers.size > 0 ? 0 : 5, Math.max(0, 12 - pending.size));
   // ofertas EN PARALELO: en serie, cada ICE podía tardar 5s → hasta 25s sin anunciar
   const offers = (await Promise.all(
     Array.from({ length: want }, async () => {
@@ -470,8 +473,9 @@ async function announce(ws) {
       } catch { return null; } // límite del navegador: esa oferta se pierde, seguimos
     }),
   )).filter(Boolean);
-  if (offers.length)
-    ws.send(JSON.stringify({ action: 'announce', info_hash: infoHash, peer_id: selfId, numwant: offers.length, uploaded: 0, downloaded: 0, left: 0, event: 'started', offers }));
+  // anunciar SIEMPRE (aun sin ofertas): mantiene viva la presencia en el tracker
+  // para poder responder a las ofertas de dispositivos nuevos
+  ws.send(JSON.stringify({ action: 'announce', info_hash: infoHash, peer_id: selfId, numwant: offers.length, uploaded: 0, downloaded: 0, left: 0, event: 'started', offers }));
 }
 async function onTracker(ws, msg) {
   if (msg.info_hash && msg.info_hash !== infoHash) return;
@@ -581,6 +585,7 @@ async function refresh(dataChanged) {
   $('add').hidden = $('paste').hidden = meta.role !== 'owner';
   $('find').hidden = false;
   $('share').hidden = false;
+  $('forget').hidden = false;
   updateNet();
 }
 
@@ -799,6 +804,17 @@ $('share').onclick = () => {
   log('enlace secreto copiado — compártelo SOLO con tus dispositivos');
 };
 
+// salir: borra réplica local, llaves y config de ESTE dispositivo.
+// (No borra nada en los demás — en P2P cada dispositivo es dueño de su copia.)
+$('forget').onclick = async () => {
+  const msg = meta?.role === 'owner'
+    ? '¿Olvidar este cerebro AQUÍ? Eres el OWNER: si ningún otro dispositivo tiene réplica, las notas se pierden para siempre. ¿Continuar?'
+    : '¿Olvidar este cerebro en este dispositivo? Se borra la réplica y la llave. Necesitarás el enlace secreto para volver.';
+  if (!confirm(msg)) return;
+  await new Promise((res) => { const r = indexedDB.deleteDatabase('noteschain-v2'); r.onsuccess = res; r.onerror = res; r.onblocked = res; });
+  location.reload();
+};
+
 /* ---------- arranque ---------- */
 async function enterMain() {
   $('setup').hidden = true;
@@ -979,7 +995,9 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
       const ngeo = new T.BufferGeometry().setFromPoints([tip]);
       const node = new T.Points(ngeo, nodeMat);
       group.add(line, node);
-      branches.push({ id: note.id, curve, tip });
+      // guardar line/node: sin las referencias, el rebuild no podía limpiarlas
+      // y cada re-sync dejaba ramas huérfanas duplicadas
+      branches.push({ id: note.id, curve, tip, line, node });
     });
     rebuildSparks();
   }
