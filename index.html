@@ -116,7 +116,41 @@
   }
   #modal .sheet img { max-width: 100%; display: block; margin: .6rem 0; }
   #m-view h3 { font-size: 1rem; margin-bottom: .8rem; }
-  #m-view pre { white-space: pre-wrap; word-break: break-word; font: inherit; font-size: .82rem; line-height: 1.7; margin-bottom: 1rem; }
+  #m-view .prose { white-space: pre-wrap; word-break: break-word; font-size: .82rem; line-height: 1.7; margin-bottom: .8rem; }
+
+  /* bloques de código */
+  .code { border: 1px solid var(--ink); margin: .6rem 0 1rem; }
+  .code-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--line); padding: .3rem .5rem;
+    font-size: .58rem; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
+  }
+  .code-bar button { padding: .2rem .5rem; font-size: .55rem; }
+  .code pre {
+    margin: 0; padding: .7rem;
+    font-size: .74rem; line-height: 1.6;
+    overflow-x: auto; white-space: pre;
+    background: rgba(0,0,0,.035);
+  }
+
+  /* archivos adjuntos */
+  .fchip {
+    display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+    border: 1px solid var(--line); padding: .35rem .5rem; margin-top: .3rem;
+    font-size: .6rem; color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  a.fchip.dl { text-decoration: none; }
+  a.fchip.dl:hover { border-color: var(--ink); }
+  .ncard .fchip { font-size: .55rem; }
+  body.dropping::after {
+    content: 'suelta para adjuntar';
+    position: fixed; inset: .6rem; z-index: 60;
+    border: 2px dashed var(--ink);
+    display: flex; align-items: center; justify-content: center;
+    font-size: .7rem; letter-spacing: .2em; text-transform: uppercase;
+    background: rgba(255,255,255,.75); pointer-events: none;
+  }
   #m-view small { display:block; color: var(--dim); font-size: .62rem; margin-bottom: 1rem; }
   .row { display: flex; gap: .5rem; flex-wrap: wrap; }
   #paste-hint { font-size: .6rem; color: var(--dim); margin-bottom: .6rem; }
@@ -265,9 +299,11 @@
       <input id="e-title" placeholder="título" />
       <textarea id="e-content" placeholder="escribe o pega tu nota… (⌘V / Ctrl+V — también imágenes)" rows="8"></textarea>
       <div id="e-img"></div>
-      <p id="paste-hint">⌘C/⌘V y Ctrl+C/Ctrl+V funcionan aquí. Pega una imagen y se cifra junto a la nota.</p>
+      <p id="paste-hint">⌘V / Ctrl+V pega texto, imágenes o archivos. También puedes arrastrarlos aquí. Para código usa ```lenguaje … ``` — todo se cifra antes de salir del dispositivo.</p>
+      <input type="file" id="e-file" multiple hidden />
       <div class="row">
         <button id="e-save">guardar</button>
+        <button id="e-attach" class="ghost">adjuntar archivo</button>
         <button id="e-cancel" class="ghost">cancelar</button>
       </div>
     </div>
@@ -340,7 +376,13 @@ const enc = (s) => new TextEncoder().encode(s);
 const dec = (b) => new TextDecoder().decode(b);
 const bytesHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 const hexBytes = (hex) => Uint8Array.from(hex.match(/../g), (h) => parseInt(h, 16));
-const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+// por trozos: el spread revienta con buffers grandes (límite de argumentos)
+const b64 = (buf) => {
+  const u = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192));
+  return btoa(s);
+};
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const sha256Hex = async (str) => bytesHex(await crypto.subtle.digest('SHA-256', enc(str)));
 
@@ -414,9 +456,16 @@ async function verifyChain(blocks, expectedId) {
 }
 
 /* ---------- IndexedDB ---------- */
+const STORES = ['blocks', 'meta', 'blobs'];
 const openIdb = () => new Promise((res, rej) => {
-  const r = indexedDB.open('noteschain-v2', 1);
-  r.onupgradeneeded = () => { r.result.createObjectStore('blocks', { keyPath: 'index' }); r.result.createObjectStore('meta'); };
+  const r = indexedDB.open('noteschain-v2', 2);
+  r.onupgradeneeded = () => {
+    const db = r.result;
+    if (!db.objectStoreNames.contains('blocks')) db.createObjectStore('blocks', { keyPath: 'index' });
+    if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+    // blobs: binarios cifrados fuera de la cadena, direccionados por hash
+    if (!db.objectStoreNames.contains('blobs')) db.createObjectStore('blobs', { keyPath: 'hash' });
+  };
   r.onsuccess = () => res(r.result);
   r.onerror = () => rej(r.error);
 });
@@ -428,7 +477,7 @@ async function idb() {
   let db = await openIdb();
   // base existente sin stores (estado corrupto) → recrear, si no la app
   // quedaría inservible para siempre en ese navegador
-  if (!db.objectStoreNames.contains('blocks') || !db.objectStoreNames.contains('meta')) {
+  if (STORES.some((s) => !db.objectStoreNames.contains(s))) {
     db.close();
     await new Promise((res) => { const r = indexedDB.deleteDatabase('noteschain-v2'); r.onsuccess = res; r.onerror = res; r.onblocked = res; });
     db = await openIdb();
@@ -444,9 +493,8 @@ async function wipeIdb() {
   try {
     const db = await idb();
     await new Promise((res, rej) => {
-      const tx = db.transaction(['blocks', 'meta'], 'readwrite');
-      tx.objectStore('blocks').clear();
-      tx.objectStore('meta').clear();
+      const tx = db.transaction(STORES, 'readwrite');
+      for (const s of STORES) tx.objectStore(s).clear();
       tx.oncomplete = res; tx.onerror = () => rej(tx.error);
     });
   } catch {}
@@ -462,8 +510,68 @@ let PERSIST = true;
 const dbWrite = async (fn) => {
   if (!PERSIST) return;
   const d = await idb();
-  return new Promise((res, rej) => { const tx = d.transaction(['blocks', 'meta'], 'readwrite'); fn(tx); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+  return new Promise((res, rej) => { const tx = d.transaction(STORES, 'readwrite'); fn(tx); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
 };
+
+/* ============================================================
+   BLOBS — archivos e imágenes. No van dentro de la cadena: los bloques
+   solo guardan {name, type, size, hash} cifrados, y el binario viaja aparte
+   por trozos. Así el sync inicial sigue siendo ligero y el canal WebRTC
+   (que se rompe con mensajes grandes) nunca se atraganta.
+   Cada blob se guarda CIFRADO y se verifica por el hash de su contenido claro.
+   ============================================================ */
+const MAX_FILE = 25 * 1024 * 1024; // 25 MB por archivo
+const CHUNK = 48 * 1024; // bytes de ciphertext por mensaje
+const memBlobs = new Map(); // sesión efímera (invitado): blobs solo en memoria
+
+const bufHashHex = async (buf) => bytesHex(await crypto.subtle.digest('SHA-256', buf));
+
+async function encryptBytes(buf) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, Security.aesKey, buf);
+  return { iv, ct };
+}
+const decryptBytes = ({ iv, ct }) =>
+  crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, Security.aesKey, ct);
+
+async function putBlob(hash, rec) {
+  memBlobs.set(hash, rec);
+  if (PERSIST) await dbWrite((tx) => tx.objectStore('blobs').put({ hash, iv: rec.iv, ct: rec.ct }));
+}
+async function getBlobRec(hash) {
+  if (memBlobs.has(hash)) return memBlobs.get(hash);
+  const rec = await dbGet('blobs', hash).catch(() => null);
+  if (rec) memBlobs.set(hash, { iv: rec.iv, ct: rec.ct });
+  return rec ? { iv: rec.iv, ct: rec.ct } : null;
+}
+const hasBlob = async (hash) => Boolean(await getBlobRec(hash));
+
+// Archivo del usuario → blob cifrado + descriptor para la nota
+async function ingestFile(file) {
+  if (file.size > MAX_FILE) { log(`"${file.name}" supera 25 MB — no añadido`); return null; }
+  const buf = await file.arrayBuffer();
+  const hash = await bufHashHex(buf);
+  if (!(await hasBlob(hash))) await putBlob(hash, await encryptBytes(buf));
+  return { name: file.name || 'archivo', type: file.type || 'application/octet-stream', size: file.size, hash };
+}
+
+// URL utilizable (blob:) para mostrar o descargar; null si aún no llegó
+const urlCache = new Map();
+async function blobUrl(f) {
+  if (urlCache.has(f.hash)) return urlCache.get(f.hash);
+  const rec = await getBlobRec(f.hash);
+  if (!rec) return null;
+  try {
+    const plain = await decryptBytes(rec);
+    const url = URL.createObjectURL(new Blob([plain], { type: f.type }));
+    urlCache.set(f.hash, url);
+    return url;
+  } catch { return null; }
+}
+
+const notesFiles = () => notes.flatMap((n) => n.files ?? []);
+const isImage = (f) => (f.type || '').startsWith('image/');
+const prettySize = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(0)} KB` : `${(b / 1048576).toFixed(1)} MB`);
 
 /* ---------- estado ---------- */
 let blocks = [], meta = null, peers = new Map();
@@ -589,6 +697,59 @@ const saveTomb = () => dbWrite((tx) => {
 function broadcast(msg) {
   const d = JSON.stringify(msg);
   for (const p of peers.values()) if (p.dc?.readyState === 'open') p.dc.send(d);
+}
+
+/* ---------- transferencia de blobs por trozos ---------- */
+const incoming = new Map(); // hash → { iv, chunks[], total, got }
+const asking = new Set(); // hashes ya pedidos (no duplicar peticiones)
+
+// pide a cualquier sinapsis los archivos que las notas referencian y no tengo
+async function requestMissingBlobs() {
+  const dcs = [...peers.values()].filter((p) => p.dc?.readyState === 'open').map((p) => p.dc);
+  if (!dcs.length) return;
+  for (const f of notesFiles()) {
+    if (asking.has(f.hash) || (await hasBlob(f.hash))) continue;
+    asking.add(f.hash);
+    dcs[0].send(JSON.stringify({ t: 'GET_BLOB', hash: f.hash }));
+  }
+}
+
+async function sendBlob(dc, hash) {
+  const rec = await getBlobRec(hash);
+  if (!rec) return;
+  const ct = new Uint8Array(rec.ct);
+  const chunks = Math.ceil(ct.length / CHUNK);
+  dc.send(JSON.stringify({ t: 'BLOB_START', hash, iv: b64(rec.iv), chunks }));
+  for (let i = 0; i < chunks; i++) {
+    // backpressure: no ahogar el canal (se cerraría por buffer lleno)
+    while (dc.readyState === 'open' && dc.bufferedAmount > 512 * 1024) await new Promise((r) => setTimeout(r, 60));
+    if (dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({ t: 'BLOB_CHUNK', hash, i, d: b64(ct.subarray(i * CHUNK, (i + 1) * CHUNK)) }));
+  }
+}
+
+async function onBlobChunk(m) {
+  const st = incoming.get(m.hash);
+  if (!st) return;
+  st.chunks[m.i] = unb64(m.d);
+  st.got++;
+  if (st.got < st.total) return;
+  incoming.delete(m.hash);
+  // reensamblar el ciphertext y comprobar que el contenido es EL pedido
+  const size = st.chunks.reduce((a, c) => a + c.length, 0);
+  const ct = new Uint8Array(size);
+  let off = 0;
+  for (const c of st.chunks) { ct.set(c, off); off += c.length; }
+  const rec = { iv: unb64(st.iv), ct: ct.buffer };
+  try {
+    const plain = await decryptBytes(rec);
+    if ((await bufHashHex(plain)) !== m.hash) return log('archivo descartado: hash no coincide');
+    await putBlob(m.hash, rec);
+    asking.delete(m.hash);
+    urlCache.delete(m.hash);
+    log('archivo recibido y verificado');
+    renderAll();
+  } catch { log('archivo descartado: no se pudo descifrar'); }
 }
 
 /* ---------- P2P (trackers WebTorrent, solo señalización) ---------- */
@@ -788,6 +949,9 @@ function wire(pc, dc) {
     }
     else if (m.t === 'BLOCKS') { if (!tombstone) enqueue(() => adoptChain(m.blocks)); }
     else if (m.t === 'NEW_BLOCK') { if (!tombstone) enqueue(() => receiveBlock(m.block, dc)); }
+    else if (m.t === 'GET_BLOB') { if (!tombstone) sendBlob(dc, m.hash); }
+    else if (m.t === 'BLOB_START') incoming.set(m.hash, { iv: m.iv, chunks: new Array(m.chunks), total: m.chunks, got: 0 });
+    else if (m.t === 'BLOB_CHUNK') enqueue(() => onBlobChunk(m));
   };
 }
 
@@ -811,8 +975,10 @@ function updateNet() {
       ? 'sincronizado p2p · cifrado'
       : sockets.length ? `buscando peers… (${sockets.length} trackers)` : 'offline · réplica local';
 }
+const renderAll = () => { syncCards(); if (!$('modal').hidden && viewingId) openView(viewingId); };
+
 async function refresh(dataChanged) {
-  if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); }
+  if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); requestMissingBlobs(); }
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
   $('role').textContent = meta.role === 'owner' ? 'owner' : 'lector';
@@ -840,113 +1006,209 @@ function syncCards() {
       cardEls.set(n.id, el);
       el._sig = null;
     }
-    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${n.updatedAt}`;
+    const files = n.files ?? [];
+    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${files.map((f) => f.hash).join()}|${n.updatedAt}`;
     if (el._sig !== sig) {
       el._sig = sig;
       el.innerHTML = '';
-      if (n.image) { const img = document.createElement('img'); img.src = n.image; el.append(img); }
+      const img = files.find(isImage);
+      if (n.image || img) {
+        const im = document.createElement('img');
+        if (n.image) im.src = n.image;
+        else blobUrl(img).then((u) => { if (u) im.src = u; else im.replaceWith(pendingBox()); });
+        el.append(im);
+      }
       const h = document.createElement('h4'); h.textContent = n.title || '(sin título)'; el.append(h);
-      const txt = n.content ?? '';
-      if (!n.image || txt) {
+      const txt = stripCode(n.content ?? '');
+      if (txt) {
         const p = document.createElement('p');
         p.textContent = txt.length > SUMMARY_LEN ? txt.slice(0, SUMMARY_LEN) + '…' : txt;
         el.append(p);
+      }
+      // archivos no-imagen: fila tipo "file"
+      for (const f of files.filter((x) => !isImage(x))) {
+        const row = document.createElement('div');
+        row.className = 'fchip';
+        row.textContent = `▤ ${f.name} · ${prettySize(f.size)}`;
+        el.append(row);
+      }
+      if (hasCode(n.content ?? '')) {
+        const row = document.createElement('div');
+        row.className = 'fchip';
+        row.textContent = '‹/› código';
+        el.append(row);
       }
     }
   }
   for (const [id, el] of cardEls) if (!seen.has(id)) { el.remove(); cardEls.delete(id); }
 }
+const pendingBox = () => { const d = document.createElement('div'); d.className = 'fchip'; d.textContent = '⏳ recibiendo archivo…'; return d; };
+
+/* ---------- código en el contenido: ```lang … ``` ---------- */
+const CODE_RE = /```([\w+-]*)\n?([\s\S]*?)```/g;
+const hasCode = (t) => /```[\s\S]*?```/.test(t);
+const stripCode = (t) => t.replace(CODE_RE, ' ').replace(/\s+/g, ' ').trim();
+
+// texto → nodos: párrafos con enlaces + bloques de código con botón copiar
+function renderRichContent(el, text) {
+  el.textContent = '';
+  let last = 0, m;
+  CODE_RE.lastIndex = 0;
+  while ((m = CODE_RE.exec(text))) {
+    if (m.index > last) el.append(textWithLinks(text.slice(last, m.index)));
+    el.append(codeBlock(m[2].replace(/\n$/, ''), m[1]));
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) el.append(textWithLinks(text.slice(last)));
+}
+
+function textWithLinks(chunk) {
+  const p = document.createElement('div');
+  p.className = 'prose';
+  const re = /https?:\/\/[^\s]+/g;
+  let last = 0, m;
+  while ((m = re.exec(chunk))) {
+    p.append(chunk.slice(last, m.index));
+    const a = document.createElement('a');
+    a.href = m[0]; a.textContent = m[0]; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    p.append(a);
+    last = m.index + m[0].length;
+  }
+  p.append(chunk.slice(last));
+  return p;
+}
+
+function codeBlock(code, lang) {
+  const wrap = document.createElement('div');
+  wrap.className = 'code';
+  const bar = document.createElement('div');
+  bar.className = 'code-bar';
+  const tag = document.createElement('span');
+  tag.textContent = lang || 'code';
+  const cp = document.createElement('button');
+  cp.className = 'ghost';
+  cp.textContent = 'copiar';
+  cp.onclick = () => { navigator.clipboard.writeText(code); cp.textContent = 'copiado'; setTimeout(() => (cp.textContent = 'copiar'), 1200); };
+  bar.append(tag, cp);
+  const pre = document.createElement('pre');
+  pre.textContent = code;
+  wrap.append(bar, pre);
+  return wrap;
+}
 
 /* ---------- modal ver/editar ---------- */
 let editingId = null;
 let pendingImage = null;
-// URLs del contenido → enlaces clickeables (sin innerHTML: a prueba de inyección)
-function renderContentWithLinks(el, text) {
-  el.textContent = '';
-  const re = /https?:\/\/[^\s]+/g;
-  let last = 0, m;
-  while ((m = re.exec(text))) {
-    el.append(text.slice(last, m.index));
-    const a = document.createElement('a');
-    a.href = m[0]; a.textContent = m[0]; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    el.append(a);
-    last = m.index + m[0].length;
-  }
-  el.append(text.slice(last));
-}
-
-function openView(id) {
+let viewingId = null;
+async function openView(id) {
   const n = notes.find((x) => x.id === id); if (!n) return;
+  viewingId = id;
   $('modal').hidden = false; $('m-view').hidden = false; $('m-edit').hidden = true;
   $('v-title').textContent = n.title || '(sin título)';
-  renderContentWithLinks($('v-content'), n.content ?? '');
+  renderRichContent($('v-content'), n.content ?? '');
   $('v-date').textContent = new Date(n.updatedAt).toLocaleString();
-  $('v-img').innerHTML = '';
-  if (n.image) { const img = document.createElement('img'); img.src = n.image; $('v-img').append(img); }
+  const box = $('v-img');
+  box.innerHTML = '';
+  if (n.image) { const img = document.createElement('img'); img.src = n.image; box.append(img); }
+  for (const f of n.files ?? []) {
+    const url = await blobUrl(f);
+    if (!url) { const p = pendingBox(); p.textContent = `⏳ ${f.name} — recibiendo…`; box.append(p); continue; }
+    if (isImage(f)) { const img = document.createElement('img'); img.src = url; box.append(img); }
+    const a = document.createElement('a');
+    a.className = 'fchip dl';
+    a.href = url; a.download = f.name;
+    a.textContent = `↓ ${f.name} · ${prettySize(f.size)}`;
+    box.append(a);
+  }
   $('v-edit').hidden = $('v-del').hidden = meta.role !== 'owner';
   $('v-edit').onclick = () => openEdit(id);
-  $('v-del').onclick = async () => { $('modal').hidden = true; await appendOp('NOTE_DELETE', { noteId: id }); };
+  $('v-del').onclick = async () => { $('modal').hidden = true; viewingId = null; await appendOp('NOTE_DELETE', { noteId: id }); };
 }
+let pendingFiles = []; // adjuntos de la nota en edición
 function openEdit(id) {
   editingId = id;
   const n = id ? notes.find((x) => x.id === id) : null;
   $('modal').hidden = false; $('m-view').hidden = true; $('m-edit').hidden = false;
   $('e-title').value = n?.title ?? '';
   $('e-content').value = n?.content ?? '';
-  pendingImage = n?.image ?? null;
+  pendingImage = n?.image ?? null; // imágenes de notas antiguas
+  pendingFiles = [...(n?.files ?? [])];
   renderPendingImg();
   $('e-title').focus();
 }
-function renderPendingImg() {
-  $('e-img').innerHTML = '';
-  if (!pendingImage) return;
-  const img = document.createElement('img'); img.src = pendingImage; img.style.maxWidth = '100%';
-  const rm = document.createElement('button'); rm.className = 'ghost'; rm.textContent = 'quitar imagen';
-  rm.onclick = () => { pendingImage = null; renderPendingImg(); };
-  $('e-img').append(img, rm);
+async function renderPendingImg() {
+  const box = $('e-img');
+  box.innerHTML = '';
+  if (pendingImage) {
+    const img = document.createElement('img'); img.src = pendingImage; img.style.maxWidth = '100%';
+    const rm = document.createElement('button'); rm.className = 'ghost'; rm.textContent = 'quitar imagen';
+    rm.onclick = () => { pendingImage = null; renderPendingImg(); };
+    box.append(img, rm);
+  }
+  for (const f of pendingFiles) {
+    const row = document.createElement('div');
+    row.className = 'fchip';
+    if (isImage(f)) {
+      const u = await blobUrl(f);
+      if (u) { const img = document.createElement('img'); img.src = u; img.style.maxWidth = '100%'; box.append(img); }
+    }
+    row.textContent = `▤ ${f.name} · ${prettySize(f.size)}`;
+    const rm = document.createElement('button');
+    rm.className = 'ghost'; rm.textContent = 'quitar';
+    rm.onclick = () => { pendingFiles = pendingFiles.filter((x) => x !== f); renderPendingImg(); };
+    row.append(rm);
+    box.append(row);
+  }
 }
-$('v-close').onclick = () => ($('modal').hidden = true);
-$('e-cancel').onclick = () => ($('modal').hidden = true);
+
+async function attachFiles(fileList) {
+  for (const file of fileList) {
+    const desc = await ingestFile(file);
+    if (desc && !pendingFiles.some((f) => f.hash === desc.hash)) pendingFiles.push(desc);
+  }
+  renderPendingImg();
+}
+
+$('e-attach').onclick = () => $('e-file').click();
+$('e-file').onchange = (e) => { attachFiles(e.target.files); e.target.value = ''; };
+$('v-close').onclick = () => { $('modal').hidden = true; viewingId = null; };
+$('e-cancel').onclick = () => { $('modal').hidden = true; viewingId = null; };
 $('add').onclick = () => openEdit(null);
 $('e-save').onclick = async () => {
   const title = $('e-title').value.trim(), content = $('e-content').value;
-  if (!title && !content && !pendingImage) return;
+  if (!title && !content && !pendingImage && !pendingFiles.length) return;
   $('modal').hidden = true;
-  const data = { title, content, image: pendingImage };
+  const data = { title, content, image: pendingImage, files: pendingFiles };
   const payload = { noteId: editingId ?? crypto.randomUUID(), enc: await Security.encrypt(data) };
   await appendOp(editingId ? 'NOTE_EDIT' : 'NOTE_ADD', payload);
 };
-$('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true; };
+$('modal').onclick = (e) => { if (e.target === $('modal')) { $('modal').hidden = true; viewingId = null; } };
 
-// pegar imágenes: ⌘V / Ctrl+V en el editor (el texto pega nativo)
+// pegar imágenes/archivos en el editor (el texto sigue pegando nativo)
 $('e-content').addEventListener('paste', async (e) => {
-  const item = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith('image/'));
-  if (!item) return; // texto → comportamiento nativo intacto
+  const files = [...(e.clipboardData?.items ?? [])].filter((i) => i.kind === 'file').map((i) => i.getAsFile()).filter(Boolean);
+  if (!files.length) return;
   e.preventDefault();
-  const file = item.getAsFile();
-  pendingImage = await resizeImage(file, 900);
-  renderPendingImg();
+  await attachFiles(files);
 });
-function resizeImage(file, max) {
-  return new Promise((res) => {
-    const img = new Image();
-    img.onload = () => {
-      const k = Math.min(1, max / Math.max(img.width, img.height));
-      const c = document.createElement('canvas');
-      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
-      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-      res(c.toDataURL('image/jpeg', 0.82));
-      URL.revokeObjectURL(img.src);
-    };
-    img.src = URL.createObjectURL(file);
-  });
-}
+
+// arrastrar y soltar archivos en cualquier parte (owner)
+addEventListener('dragover', (e) => { if (meta?.role === 'owner') { e.preventDefault(); document.body.classList.add('dropping'); } });
+addEventListener('dragleave', () => document.body.classList.remove('dropping'));
+addEventListener('drop', async (e) => {
+  if (meta?.role !== 'owner' || !e.dataTransfer?.files.length) return;
+  e.preventDefault();
+  document.body.classList.remove('dropping');
+  if ($('m-edit').hidden) { openEdit(null); } // sin editor abierto: nota nueva con los archivos
+  await attachFiles(e.dataTransfer.files);
+  if (!$('e-title').value) $('e-title').value = e.dataTransfer.files[0].name;
+});
 
 // ⌘V / Ctrl+V FUERA del editor → crea la nota directamente (texto o imagen)
-const noteFromText = (text) => ({ title: text.trim().split('\n')[0].slice(0, 48), content: text, image: null });
+const noteFromText = (text) => ({ title: text.trim().split('\n')[0].slice(0, 48), content: text, image: null, files: [] });
 async function createNote(data) {
   // jamás crear neuronas vacías (pegados fallidos, portapapeles raro)
-  if (!data.title?.trim() && !data.content?.trim() && !data.image) return log('nada que pegar — nota no creada');
+  if (!data.title?.trim() && !data.content?.trim() && !data.image && !data.files?.length) return log('nada que pegar — nota no creada');
   await appendOp('NOTE_ADD', { noteId: crypto.randomUUID(), enc: await Security.encrypt(data) });
   log('nota creada — nueva neurona');
 }
@@ -959,9 +1221,12 @@ window.addEventListener('paste', async (e) => {
   const sig = e.clipboardData?.getData('text') || 'img';
   if (sig === lastPaste.sig && Date.now() - lastPaste.ts < 3000) return;
   lastPaste = { sig, ts: Date.now() };
-  const imgItem = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith('image/'));
-  if (imgItem) {
-    await createNote({ title: 'Imagen ' + new Date().toLocaleTimeString(), content: '', image: await resizeImage(imgItem.getAsFile(), 900) });
+  const files = [...(e.clipboardData?.items ?? [])].filter((i) => i.kind === 'file').map((i) => i.getAsFile()).filter(Boolean);
+  if (files.length) {
+    const descs = [];
+    for (const f of files) { const d = await ingestFile(f); if (d) descs.push(d); }
+    if (!descs.length) return;
+    await createNote({ title: descs[0].name, content: '', image: null, files: descs });
   } else {
     const text = e.clipboardData?.getData('text') ?? '';
     if (!text.trim()) return;
@@ -978,7 +1243,9 @@ $('paste').onclick = async () => {
           const imgType = item.types.find((t) => t.startsWith('image/'));
           if (imgType) {
             const blob = await item.getType(imgType);
-            return createNote({ title: 'Imagen ' + new Date().toLocaleTimeString(), content: '', image: await resizeImage(blob, 900) });
+            const name = `imagen-${Date.now()}.${(imgType.split('/')[1] || 'png')}`;
+            const desc = await ingestFile(new File([blob], name, { type: imgType }));
+            if (desc) return createNote({ title: name, content: '', image: null, files: [desc] });
           }
         }
       } catch {} // sin imagen o sin permiso de read(): probar texto
