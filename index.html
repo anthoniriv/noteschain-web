@@ -439,20 +439,22 @@ async function announce(ws) {
   if (ws.readyState !== WebSocket.OPEN) return;
   cleanPending(); // ofertas viejas no consumidas → cerrar (evita fugar PeerConnections)
   // sin sinapsis: muchas ofertas listas (emparejar rápido); con sinapsis: pocas
-  const want = peers.size > 0 ? 1 : 5;
-  const offers = [];
-  for (let i = 0; i < want && pending.size < 12; i++) {
-    try {
-      const pc = new RTCPeerConnection(RTC);
-      const dc = pc.createDataChannel('nc');
-      wire(pc, dc);
-      await pc.setLocalDescription(await pc.createOffer());
-      await ice(pc);
-      const id = randBin(20);
-      pending.set(id, { pc, ts: Date.now() });
-      offers.push({ offer_id: id, offer: { type: 'offer', sdp: pc.localDescription.sdp } });
-    } catch { break; } // límite del navegador: parar y reintentar en el próximo announce
-  }
+  const want = Math.min(peers.size > 0 ? 1 : 5, Math.max(0, 12 - pending.size));
+  // ofertas EN PARALELO: en serie, cada ICE podía tardar 5s → hasta 25s sin anunciar
+  const offers = (await Promise.all(
+    Array.from({ length: want }, async () => {
+      try {
+        const pc = new RTCPeerConnection(RTC);
+        const dc = pc.createDataChannel('nc');
+        wire(pc, dc);
+        await pc.setLocalDescription(await pc.createOffer());
+        await ice(pc);
+        const id = randBin(20);
+        pending.set(id, { pc, ts: Date.now() });
+        return { offer_id: id, offer: { type: 'offer', sdp: pc.localDescription.sdp } };
+      } catch { return null; } // límite del navegador: esa oferta se pierde, seguimos
+    }),
+  )).filter(Boolean);
   if (offers.length)
     ws.send(JSON.stringify({ action: 'announce', info_hash: infoHash, peer_id: selfId, numwant: offers.length, uploaded: 0, downloaded: 0, left: 0, event: 'started', offers }));
 }
@@ -477,7 +479,7 @@ async function onTracker(ws, msg) {
 }
 const ice = (pc) => new Promise((res) => {
   if (pc.iceGatheringState === 'complete') return res();
-  const t = setTimeout(res, 5000); // iOS junta candidatos lento — darle margen
+  const t = setTimeout(res, 3000); // margen para iOS sin frenar el announce
   pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } };
 });
 // Los mensajes de cadena se procesan EN SERIE: evita la carrera donde dos
