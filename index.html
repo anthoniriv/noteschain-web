@@ -516,9 +516,10 @@ const GENESIS_PREV = '0'.repeat(64);
 // Los campos extra SOLO se añaden en los tipos nuevos (DEVICE_*): si se
 // agregaran al array base, los bloques ya existentes cambiarían de hash y
 // toda la cadena guardada quedaría inválida.
+const AUTH_TYPES = ['DEVICE_ADD', 'DEVICE_REVOKE', 'SUCCESSION', 'OWNER_TRANSFER', 'OWNER_CLAIM'];
 const serialize = (i, prev, ts, type, p) => {
   const base = [i, prev, ts, type, p.noteId ?? null, p.enc ?? null, p.ownerPubKey ?? null];
-  if (type === 'DEVICE_ADD' || type === 'DEVICE_REVOKE') base.push(p.pubKey ?? null);
+  if (AUTH_TYPES.includes(type)) base.push(p.pubKey ?? null, p.heirs ?? null);
   return JSON.stringify(base);
 };
 const hashBlock = (b) => sha256Hex(serialize(b.index, b.prevHash, b.timestamp, b.type, b.payload));
@@ -529,10 +530,37 @@ async function ownerVerifyKey(pubHex) {
     keyCache.set(pubHex, await crypto.subtle.importKey('raw', hexBytes(pubHex), { name: 'Ed25519' }, false, ['verify']));
   return keyCache.get(pubHex);
 }
-const blockSigner = (b, owner) => b.signerPubKey ?? owner; // bloques antiguos: los firmaba el owner
+const blockSigner = (b, genesisOwner) => b.signerPubKey ?? genesisOwner; // bloques antiguos: los firmaba el owner
+
+/* ---------- autoridad viva ----------
+   El owner puede cambiar: al cerrar su pestaña traspasa el mando (OWNER_TRANSFER),
+   y si desaparece de golpe, el primer heredero vivo del testamento firmado
+   (SUCCESSION) lo reclama (OWNER_CLAIM). Así la custodia nunca queda huérfana
+   mientras algún dispositivo siga despierto. */
+function authorityOf(chain) {
+  const genesisOwner = chain[0]?.payload.ownerPubKey ?? '';
+  let owner = genesisOwner;
+  let heirs = [];
+  for (const b of chain) {
+    const signer = blockSigner(b, genesisOwner);
+    if (b.type === 'SUCCESSION' && signer === owner) heirs = b.payload.heirs ?? [];
+    // el owner nombra sucesor al irse
+    else if (b.type === 'OWNER_TRANSFER' && signer === owner && b.payload.pubKey) {
+      owner = b.payload.pubKey;
+      heirs = heirs.filter((h) => h !== owner);
+    }
+    // el heredero reclama tras la desaparición del owner
+    else if (b.type === 'OWNER_CLAIM' && signer && heirs.includes(signer)) {
+      owner = signer;
+      heirs = heirs.filter((h) => h !== owner);
+    }
+  }
+  return { owner, heirs, genesisOwner };
+}
+const currentOwner = (chain) => authorityOf(chain).owner;
 
 // `writers` = claves autorizadas a escribir en el momento de este bloque.
-async function verifyBlock(b, prev, owner, writers) {
+async function verifyBlock(b, prev, owner, writers, ctx) {
   if ((await hashBlock(b)) !== b.hash) return 'hash inválido';
   if (prev === null) {
     if (b.index !== 0 || b.prevHash !== GENESIS_PREV || b.type !== 'GENESIS') return 'génesis malformado';
@@ -544,19 +572,26 @@ async function verifyBlock(b, prev, owner, writers) {
   }
   const signer = blockSigner(b, owner);
   if (writers && !writers.has(signer)) return 'firmante no autorizado';
-  // matar el cerebro y repartir permisos: privilegio exclusivo del owner
-  if ((b.type === 'DESTROY' || b.type === 'DEVICE_ADD' || b.type === 'DEVICE_REVOKE') && signer !== owner)
+  // privilegios del owner VIGENTE (puede haber cambiado por sucesión)
+  const auth = ctx ?? { owner, heirs: [] };
+  if (['DESTROY', 'DEVICE_ADD', 'DEVICE_REVOKE', 'SUCCESSION', 'OWNER_TRANSFER'].includes(b.type) && signer !== auth.owner)
     return `${b.type} solo lo puede firmar el owner`;
+  // reclamar el mando: solo un heredero nombrado en el testamento firmado
+  if (b.type === 'OWNER_CLAIM' && !auth.heirs.includes(signer)) return 'reclamación de owner sin herencia';
   const ok = await crypto.subtle.verify('Ed25519', await ownerVerifyKey(signer), hexBytes(b.signature), enc(b.hash));
   return ok ? null : 'firma inválida';
 }
 
 // conjunto de escritores tras aplicar la cadena entera
 function writersOf(chain) {
-  const owner = chain[0]?.payload.ownerPubKey;
-  const set = new Set(owner ? [owner] : []);
+  const genesisOwner = chain[0]?.payload.ownerPubKey;
+  const set = new Set(genesisOwner ? [genesisOwner] : []);
+  let owner = genesisOwner;
   for (const b of chain) {
-    if (blockSigner(b, owner) !== owner) continue; // solo el owner reparte permisos
+    const signer = blockSigner(b, genesisOwner);
+    if (b.type === 'OWNER_TRANSFER' && signer === owner && b.payload.pubKey) { owner = b.payload.pubKey; set.add(owner); continue; }
+    if (b.type === 'OWNER_CLAIM' && signer) { owner = signer; set.add(owner); continue; }
+    if (signer !== owner) continue; // solo el owner vigente reparte permisos
     if (b.type === 'DEVICE_ADD' && b.payload.pubKey) set.add(b.payload.pubKey);
     if (b.type === 'DEVICE_REVOKE' && b.payload.pubKey) set.delete(b.payload.pubKey);
   }
@@ -569,13 +604,18 @@ async function verifyChain(blocks, expectedId) {
   if (!owner) return 'sin owner';
   if (expectedId && blocks[0].hash !== expectedId) return 'génesis ajeno';
   const writers = new Set([owner]);
+  const ctx = { owner, heirs: [] }; // autoridad vigente, se actualiza al avanzar
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
-    const err = await verifyBlock(b, i ? blocks[i - 1] : null, owner, writers);
+    const err = await verifyBlock(b, i ? blocks[i - 1] : null, owner, writers, ctx);
     if (err) return `bloque ${i}: ${err}`;
-    // el permiso vale para los bloques SIGUIENTES
+    const signer = blockSigner(b, owner);
+    // el permiso y la autoridad valen para los bloques SIGUIENTES
     if (b.type === 'DEVICE_ADD' && b.payload.pubKey) writers.add(b.payload.pubKey);
     if (b.type === 'DEVICE_REVOKE' && b.payload.pubKey) writers.delete(b.payload.pubKey);
+    if (b.type === 'SUCCESSION') ctx.heirs = b.payload.heirs ?? [];
+    if (b.type === 'OWNER_TRANSFER' && b.payload.pubKey) { ctx.owner = b.payload.pubKey; ctx.heirs = ctx.heirs.filter((h) => h !== ctx.owner); writers.add(ctx.owner); }
+    if (b.type === 'OWNER_CLAIM') { ctx.owner = signer; ctx.heirs = ctx.heirs.filter((h) => h !== signer); }
   }
   return null;
 }
@@ -760,7 +800,7 @@ async function appendOp(type, payload) {
   const tip = blocks[blocks.length - 1] ?? null;
   const partial = { index: tip ? tip.index + 1 : 0, prevHash: tip ? tip.hash : GENESIS_PREV, timestamp: Date.now(), type, payload };
   // los bloques de un dispositivo autorizado llevan su propia clave pública
-  if (meta.role !== 'owner') partial.signerPubKey = meta.publicKeyHex;
+  if (meta.publicKeyHex) partial.signerPubKey = meta.publicKeyHex; // identidad propia si la tengo
   const hash = await hashBlock(partial);
   const signature = bytesHex(await crypto.subtle.sign('Ed25519', meta.privateKey, enc(hash)));
   const block = { ...partial, hash, signature };
@@ -904,7 +944,14 @@ function lastDeviceEvent(pub) {
 }
 const wasRevoked = (pub) => lastDeviceEvent(pub) === 'revoke';
 
-const canWrite = () => Boolean(meta) && (meta.role === 'owner' || (meta.publicKeyHex && writersOf(blocks).has(meta.publicKeyHex)));
+// ¿soy yo el owner AHORA? Lo dice la cadena, no lo que guardé al unirme:
+// la autoridad puede haber pasado a otro dispositivo (o a mí).
+const isOwner = () => {
+  if (!meta || !blocks.length) return meta?.role === 'owner';
+  const { owner, genesisOwner } = authorityOf(blocks);
+  return owner === (meta.publicKeyHex ?? genesisOwner);
+};
+const canWrite = () => Boolean(meta) && (isOwner() || (meta.publicKeyHex && writersOf(blocks).has(meta.publicKeyHex)));
 // un dispositivo revocado NO vuelve a pedir solo: la decisión del owner manda
 const wantsWrite = () => Boolean(meta?.device) && !canWrite() && !wasRevoked(meta.publicKeyHex);
 
@@ -914,7 +961,7 @@ function askForWriteAccess(dc) {
 }
 
 async function onAuthReq(dc, pub) {
-  if (meta.role !== 'owner' || !/^[0-9a-f]{64}$/.test(pub ?? '')) return;
+  if (!isOwner() || !/^[0-9a-f]{64}$/.test(pub ?? '')) return;
   if (writersOf(blocks).has(pub)) return; // ya autorizado
   // revocado antes: no se re-autoriza en automático, lo decide el owner a mano
   if (wasRevoked(pub)) {
@@ -938,11 +985,12 @@ async function onAuthChallenge(dc, m) {
 }
 
 async function onAuthProof(m) {
-  if (meta.role !== 'owner') return;
+  if (!isOwner()) return;
   if (pendingAuth.get(m.pub) !== m.nonce) return fail(`Dispositivo ${m.pub.slice(0,6)} rechazado: no superó la prueba de la llave.`);
   pendingAuth.delete(m.pub);
   if (writersOf(blocks).has(m.pub)) return;
   await appendOp('DEVICE_ADD', { pubKey: m.pub });
+  await updateSuccession();
   authRequests.delete(m.pub);
   log(`dispositivo ${m.pub.slice(0, 6)} autorizado a escribir`);
   if (!$('devs').hidden) paintDevices();
@@ -1200,7 +1248,11 @@ function wire(pc, dc) {
       }
       key = id;
       peers.set(key, { pc, dc, pub: m.pub });
-      if (m.pub) { onlinePubs.add(m.pub); if (!$('devs').hidden) paintDevices(); }
+      if (m.pub) {
+        onlinePubs.add(m.pub);
+        if (m.pub === authorityOf(blocks).owner) ownerSeenAt = Date.now();
+        if (!$('devs').hidden) paintDevices();
+      }
       // modo lápida: al primer contacto, entregar la sentencia y contar la baja
       if (tombstone) {
         try {
@@ -1276,7 +1328,7 @@ async function refresh(dataChanged) {
   const write = canWrite();
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
-  $('role').textContent = meta.role === 'owner'
+  $('role').textContent = isOwner()
     ? 'owner'
     : meta.device
       ? (write ? 'mi dispositivo' : wasRevoked(meta.publicKeyHex) ? 'escritura revocada' : 'esperando permiso')
@@ -1284,11 +1336,11 @@ async function refresh(dataChanged) {
   $('add').hidden = $('paste').hidden = !write;
   $('find').hidden = false; // buscar y descargar: todos
   // el invitado solo puede leer, buscar, descargar y salir
-  $('share').hidden = meta.role !== 'owner'; // solo el owner reparte enlaces
-  $('devices').hidden = meta.role !== 'owner';
-  $('netoggle').hidden = !meta.device && meta.role !== 'owner';
+  $('share').hidden = !isOwner(); // solo el owner reparte enlaces
+  $('devices').hidden = !isOwner();
+  $('netoggle').hidden = !meta.device && !isOwner();
   $('forget').hidden = false;
-  $('forget').textContent = meta.role === 'owner' ? 'eliminar cerebro' : 'salir';
+  $('forget').textContent = isOwner() ? 'eliminar cerebro' : 'salir';
   updateNet();
 }
 
@@ -1640,6 +1692,85 @@ $('share').onclick = async () => {
   log(mine ? 'enlace de DISPOSITIVO copiado — solo para tus equipos' : 'enlace de INVITADO copiado — sesión efímera, no recordará nada');
 };
 
+/* ============================================================
+   CUSTODIA VIVA
+   La memoria existe mientras haya alguien despierto:
+   · el owner mantiene un testamento firmado con el orden de sucesión;
+   · al cerrar su pestaña traspasa el mando y borra su copia;
+   · si desaparece de golpe, el primer heredero vivo reclama el mando;
+   · un dispositivo aislado más de 5 minutos borra su copia local.
+   ============================================================ */
+const ISOLATED_PURGE_MS = 5 * 60_000; // sin ninguna sinapsis → purga local
+const OWNER_GONE_MS = 60_000; // sin ver al owner → el heredero reclama
+let aloneSince = null;
+let ownerSeenAt = Date.now();
+let purgeWarned = false;
+let readyTransfer = null; // bloque de traspaso pre-firmado (para poder enviarlo al cerrar)
+
+const myPub = () => meta?.publicKeyHex ?? blocks[0]?.payload.ownerPubKey ?? '';
+
+// testamento: los dispositivos autorizados, en orden de antigüedad
+async function updateSuccession() {
+  if (!isOwner() || !blocks.length) return;
+  const { owner, heirs } = authorityOf(blocks);
+  const current = [...writersOf(blocks)].filter((p) => p !== owner);
+  if (JSON.stringify(current) === JSON.stringify(heirs)) return; // sin cambios
+  await appendOp('SUCCESSION', { heirs: current });
+}
+
+// bloque de traspaso listo para enviarse en el instante del cierre (firmar
+// entonces sería demasiado tarde: el navegador no espera a operaciones async)
+async function prepareTransfer() {
+  readyTransfer = null;
+  if (!isOwner() || !blocks.length) return;
+  const { heirs } = authorityOf(blocks);
+  const heir = heirs.find((h) => onlinePubs.has(h));
+  if (!heir) return; // nadie a quien pasarle el mando
+  const tip = blocks[blocks.length - 1];
+  const partial = {
+    index: tip.index + 1, prevHash: tip.hash, timestamp: Date.now(),
+    type: 'OWNER_TRANSFER', payload: { pubKey: heir }, signerPubKey: myPub(),
+  };
+  const hash = await hashBlock(partial);
+  const signature = bytesHex(await crypto.subtle.sign('Ed25519', meta.privateKey, enc(hash)));
+  readyTransfer = { ...partial, hash, signature };
+}
+
+// el owner desapareció: si soy el primer heredero vivo, tomo el mando
+async function maybeClaimOwnership() {
+  if (!meta || isOwner() || !blocks.length || dying || tombstone) return;
+  const { owner, heirs } = authorityOf(blocks);
+  if (!heirs.includes(myPub())) return; // no soy heredero
+  if (onlinePubs.has(owner)) { ownerSeenAt = Date.now(); return; }
+  if (Date.now() - ownerSeenAt < OWNER_GONE_MS) return;
+  // respeto el orden: si hay un heredero anterior vivo, le toca a él
+  const firstAlive = heirs.find((h) => h === myPub() || onlinePubs.has(h));
+  if (firstAlive !== myPub()) return;
+  await appendOp('OWNER_CLAIM', { pubKey: myPub() });
+  toast('Este dispositivo asume la custodia: el owner anterior desapareció.');
+  await refresh(true);
+}
+
+// aislamiento: sin ninguna sinapsis durante 5 minutos, esta copia se borra
+async function checkIsolation() {
+  if (!meta || isOwner() || dying || tombstone) { aloneSince = null; purgeWarned = false; return; }
+  if (peers.size > 0) { aloneSince = null; purgeWarned = false; return; }
+  if (aloneSince === null) { aloneSince = Date.now(); return; }
+  const alone = Date.now() - aloneSince;
+  if (!purgeWarned && alone > ISOLATED_PURGE_MS - 60_000) {
+    purgeWarned = true;
+    fail('Sin conexión con el cerebro: esta copia se borrará en 1 minuto.');
+  }
+  if (alone > ISOLATED_PURGE_MS) {
+    toast('Aislado demasiado tiempo: copia local borrada.', true);
+    stopP2P();
+    await wipeIdb();
+    location.reload();
+  }
+}
+
+setInterval(() => { maybeClaimOwnership(); checkIsolation(); prepareTransfer(); }, 5_000);
+
 /* ---------- panel de dispositivos (solo owner) ---------- */
 const onlinePubs = new Set(); // pubkeys vistas en las sinapsis actuales
 
@@ -1664,8 +1795,9 @@ function paintDevices() {
     ok.textContent = 'volver a autorizar';
     ok.onclick = async () => {
       await appendOp('DEVICE_ADD', { pubKey: pub });
+      await updateSuccession();
       authRequests.delete(pub);
-      log(`dispositivo ${pub.slice(0, 6)} autorizado de nuevo`);
+      toast(`Dispositivo ${pub.slice(0, 6)} autorizado de nuevo.`);
       paintDevices();
     };
     li.append(who, ok);
@@ -1698,7 +1830,8 @@ function paintDevices() {
       });
       if (!ok) return;
       await appendOp('DEVICE_REVOKE', { pubKey: pub });
-      log(`dispositivo ${pub.slice(0, 6)} revocado`);
+      await updateSuccession();
+      toast(`Dispositivo ${pub.slice(0, 6)} revocado.`);
       paintDevices();
     };
     li.append(who, rv);
@@ -1727,7 +1860,7 @@ $('netoggle').onclick = () => {
 // llaves y config de ESTE dispositivo. En P2P no se puede borrar a distancia:
 // cada dispositivo es dueño de su copia.
 $('forget').onclick = async () => {
-  if (meta?.role === 'owner') {
+  if (isOwner()) {
     const ok = await ask({
       title: 'eliminar cerebro',
       msg: 'Se emite una sentencia de muerte firmada: todos los dispositivos se desconectan y borran su réplica (los apagados, al reconectar).\n\nLas notas se pierden para siempre.',
@@ -1753,9 +1886,30 @@ $('forget').onclick = async () => {
   location.reload();
 };
 
-// cerrar la pestaña corta la conexión P2P al instante (no dejar sinapsis
-// fantasma vivas en los demás dispositivos)
-addEventListener('pagehide', () => { try { stopP2P(); } catch {} });
+// Avisar al owner antes de cerrar: al irse pierde su copia y entrega la
+// custodia (si no hay nadie despierto, la memoria muere con él).
+addEventListener('beforeunload', (e) => {
+  if (!meta || dying || tombstone || !isOwner() || !blocks.length) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+// Cierre real: traspasar el mando y borrar la copia local.
+addEventListener('pagehide', () => {
+  try {
+    if (meta && !dying && !tombstone && isOwner() && blocks.length) {
+      // el traspaso va pre-firmado: aquí solo queda enviarlo (síncrono)
+      if (readyTransfer) {
+        const msg = JSON.stringify({ t: 'NEW_BLOCK', block: readyTransfer });
+        for (const p of peers.values()) { try { p.dc.send(msg); } catch {} }
+      }
+      // la copia del owner no sobrevive al cierre (efimeridad pura)
+      localStorage.setItem('nc_purge', '1'); // por si el borrado no da tiempo
+      indexedDB.deleteDatabase('noteschain-v2');
+    }
+    stopP2P();
+  } catch {}
+});
 
 // Volver de segundo plano: reanudar YA en vez de esperar el latido y el
 // siguiente anuncio (antes tardaba ~1 min en enterarse de novedades como la
@@ -1831,6 +1985,12 @@ $('btn-join').onclick = async () => {
   enterMain();
 };
 (async () => {
+  // el owner cerró la pestaña: su copia no sobrevive (custodia viva)
+  if (localStorage.getItem('nc_purge')) {
+    localStorage.removeItem('nc_purge');
+    await wipeIdb();
+    toast('Cerraste como owner: esta copia se borró y la custodia pasó a otro dispositivo (si había alguno despierto).', true, 9000);
+  }
   // lápida guardada: seguir difundiendo la sentencia tras recargar/reabrir
   const tomb = await dbGet('meta', 'tombstone');
   if (tomb?.tomb) {
