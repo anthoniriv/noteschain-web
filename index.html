@@ -68,9 +68,19 @@
   }
   #setup h2 { font-size: .78rem; letter-spacing: .18em; text-transform: uppercase; margin-bottom: .6rem; }
   #setup p { font-size: .72rem; color: var(--dim); line-height: 1.6; margin-bottom: 1rem; }
-  #remember-row { display: flex; align-items: center; gap: .5rem; font-size: .72rem; margin-bottom: .4rem; cursor: pointer; }
-  #remember-row input { width: auto; margin: 0; accent-color: var(--ink); }
   #setup .hint { font-size: .62rem; margin-bottom: .8rem; }
+
+  /* aviso de cerebro muerto */
+  #dead {
+    position: fixed; inset: 0; z-index: 40;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1rem; text-align: center; padding: 2rem;
+    background: rgba(255,255,255,.9); backdrop-filter: blur(4px);
+    animation: fadein 1.2s ease-out;
+  }
+  @keyframes fadein { from { opacity: 0; } }
+  #dead h2 { font-size: .9rem; letter-spacing: .2em; text-transform: uppercase; }
+  #dead p { font-size: .74rem; color: var(--dim); max-width: 34ch; line-height: 1.7; }
 
   /* ---- cards de nota (proyectadas sobre el cerebro) ---- */
   .ncard {
@@ -205,8 +215,7 @@
     <h2>Conectar con enlace secreto</h2>
     <p>Pega el enlace o código que compartió el owner (contiene la llave de cifrado). Este dispositivo replica, verifica y descifra — solo lectura.</p>
     <input id="join-code" placeholder="enlace o código secreto" spellcheck="false" />
-    <label id="remember-row"><input type="checkbox" id="remember" /> recordar en este dispositivo</label>
-    <p class="hint">Sin marcar: al cerrar la pestaña este dispositivo olvida todo (nada se guarda en disco). Márcalo solo en dispositivos tuyos.</p>
+    <p class="hint">El owner decide si este dispositivo puede recordar: un enlace de invitado es siempre efímero (al cerrar la pestaña se olvida todo, nada toca el disco).</p>
     <button id="btn-join" class="ghost">conectar</button>
   </div>
 </div>
@@ -246,6 +255,12 @@
 <div id="spot" hidden>
   <div class="bar"><input id="spot-q" placeholder="buscar en el cerebro…" spellcheck="false" /></div>
   <ul id="spot-res"></ul>
+</div>
+
+<div id="dead" hidden>
+  <h2>el cerebro murió</h2>
+  <p>El owner eliminó este cerebro. Todas las sinapsis se cortaron y la réplica de este dispositivo fue borrada.</p>
+  <button id="dead-ok">entendido</button>
 </div>
 
 <div id="log"></div>
@@ -399,6 +414,8 @@ async function adoptChain(cand) {
   blocks = cand;
   await dbWrite((tx) => { tx.objectStore('blocks').clear(); for (const b of cand) tx.objectStore('blocks').put(b); });
   log(`cadena verificada · ${cand.length} bloques`);
+  // la cadena trae la sentencia de muerte (llegamos tarde a la fiesta)
+  if (cand.some((b) => b.type === 'DESTROY')) return brainDeath();
   await refresh(true);
 }
 async function receiveBlock(block, from) {
@@ -411,8 +428,24 @@ async function receiveBlock(block, from) {
   blocks.push(block);
   await dbWrite((tx) => tx.objectStore('blocks').put(block));
   for (const p of peers.values()) if (p.dc !== from && p.dc?.readyState === 'open') p.dc.send(JSON.stringify({ t: 'NEW_BLOCK', block }));
+  // sentencia de muerte firmada por el owner: nadie más puede emitirla
+  if (block.type === 'DESTROY') return brainDeath();
   await refresh(true);
 }
+
+// El cerebro murió: explosión, aviso, desconexión total y borrado de la
+// réplica local. Se dispara solo con un bloque DESTROY válido del owner.
+let dying = false;
+async function brainDeath() {
+  if (dying) return;
+  dying = true;
+  Brain.explode();
+  stopP2P();
+  await new Promise((r) => setTimeout(r, 1400)); // que se vea la explosión
+  $('dead').hidden = false;
+  await new Promise((res) => { const r = indexedDB.deleteDatabase('noteschain-v2'); r.onsuccess = res; r.onerror = res; r.onblocked = res; });
+}
+$('dead-ok').onclick = () => location.reload();
 function broadcast(msg) {
   const d = JSON.stringify(msg);
   for (const p of peers.values()) if (p.dc?.readyState === 'open') p.dc.send(d);
@@ -834,11 +867,14 @@ function paintSel() { [...$('spot-res').children].forEach((li, i) => li.classLis
 $('spot').onclick = (e) => { if (e.target === $('spot')) closeSpot(); };
 
 /* ---------- compartir ---------- */
+// El owner decide el poder del enlace: sufijo ".d" = dispositivo propio
+// (autorizado a recordar). Sin sufijo = invitado, siempre efímero.
 $('share').onclick = () => {
-  const code = `${meta.chainId}.${meta.encKey}`;
+  const mine = confirm('¿Este enlace es para un dispositivo TUYO?\n\nAceptar = mi dispositivo (podrá recordar las notas)\nCancelar = invitado (sesión efímera, olvida todo al cerrar)');
+  const code = `${meta.chainId}.${meta.encKey}${mine ? '.d' : ''}`;
   const link = location.protocol.startsWith('http') ? `${location.origin}${location.pathname}#${code}` : code;
   navigator.clipboard.writeText(link);
-  log('enlace secreto copiado — compártelo SOLO con tus dispositivos');
+  log(mine ? 'enlace de DISPOSITIVO copiado — solo para tus equipos' : 'enlace de INVITADO copiado — sesión efímera, no recordará nada');
 };
 
 // desconectar/conectar: kill switch de red — corta todas las sinapsis y
@@ -859,14 +895,22 @@ $('netoggle').onclick = () => {
 // llaves y config de ESTE dispositivo. En P2P no se puede borrar a distancia:
 // cada dispositivo es dueño de su copia.
 $('forget').onclick = async () => {
-  const msg = meta?.role === 'owner'
-    ? '¿ELIMINAR este cerebro? Se cierran todas las conexiones y se borra todo aquí (notas, llaves, enlace). Si ningún otro dispositivo tiene réplica, se pierde PARA SIEMPRE. ¿Continuar?'
-    : '¿Olvidar este cerebro en este dispositivo? Se borra la réplica y la llave. Necesitarás el enlace secreto para volver.';
-  if (!confirm(msg)) return;
+  if (meta?.role === 'owner') {
+    if (!confirm('¿ELIMINAR este cerebro?\n\nSe emite una sentencia de muerte firmada: TODOS los dispositivos conectados se desconectan y borran su réplica. Las notas se pierden PARA SIEMPRE. ¿Continuar?')) return;
+    // bloque DESTROY firmado + broadcast: mata la red, no solo este dispositivo
+    try { await appendOp('DESTROY', {}); } catch {}
+    await new Promise((r) => setTimeout(r, 600)); // dar tiempo al broadcast
+    return brainDeath();
+  }
+  if (!confirm('¿Olvidar este cerebro en este dispositivo? Se borra la réplica y la llave. Necesitarás el enlace secreto para volver.')) return;
   stopP2P();
   await new Promise((res) => { const r = indexedDB.deleteDatabase('noteschain-v2'); r.onsuccess = res; r.onerror = res; r.onblocked = res; });
   location.reload();
 };
+
+// cerrar/ocultar la pestaña corta la conexión P2P al instante (no dejar
+// sinapsis fantasma vivas en los demás dispositivos)
+addEventListener('pagehide', () => { try { stopP2P(); } catch {} });
 
 /* ---------- arranque ---------- */
 async function enterMain() {
@@ -881,6 +925,7 @@ async function enterMain() {
     await dbWrite((tx) => tx.objectStore('blocks').clear());
   }
   await rebuildNotes();
+  if (blocks.some((b) => b.type === 'DESTROY')) return brainDeath(); // cerebro ya muerto
   Brain.setNotes(notes);
   await refresh();
   startP2P();
@@ -902,19 +947,19 @@ $('btn-create').onclick = async () => {
 };
 $('btn-join').onclick = async () => {
   const raw = $('join-code').value.trim();
-  const m = raw.match(/([0-9a-f]{64})\.([0-9a-f]{64})/i);
+  const m = raw.match(/([0-9a-f]{64})\.([0-9a-f]{64})(\.d)?/i);
   if (!m) return log('código inválido — pide al owner su "enlace secreto"');
-  PERSIST = $('remember').checked; // invitados: sin marcar, sesión efímera
+  PERSIST = Boolean(m[3]); // solo el owner concede recordar, vía sufijo .d del enlace
   meta = { role: 'reader', chainId: m[1].toLowerCase(), encKey: m[2].toLowerCase() };
   await dbWrite((tx) => tx.objectStore('meta').put(meta, 'meta'));
-  log(PERSIST ? 'buscando el cerebro en la red…' : 'sesión efímera — al cerrar la pestaña se olvida todo');
+  log(PERSIST ? 'dispositivo autorizado — buscando el cerebro…' : 'sesión efímera (invitado) — al cerrar la pestaña se olvida todo');
   enterMain();
 };
 (async () => {
   meta = await dbGet('meta', 'meta');
   if (meta) { blocks = await dbAll(); enterMain(); return; }
-  const m = location.hash.slice(1).match(/([0-9a-f]{64})\.([0-9a-f]{64})/i);
-  // enlace compartido: prellenar y dejar que la persona DECIDA si recordar
+  const m = location.hash.slice(1).match(/([0-9a-f]{64})\.([0-9a-f]{64})(\.d)?/i);
+  // enlace compartido: prellenar; el permiso de recordar ya viene decidido por el owner
   if (m) { $('join-code').value = m[0]; history.replaceState(null, '', location.pathname); $('join-code').scrollIntoView(); }
 })();
 
@@ -923,7 +968,7 @@ $('btn-join').onclick = async () => {
    Rotación con mouse/trackpad, zoom con rueda. Pulsos eléctricos
    viajan del centro a las neuronas. Tinta negra sobre blanco.
    ============================================================ */
-const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
+const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {}, explode: () => {} };
 (async () => {
   let T;
   try { T = await import('https://unpkg.com/three@0.170.0/build/three.module.js'); }
@@ -1073,6 +1118,24 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
     scene.add(sparkPts);
   }
 
+  // explosión: cada punto sale disparado desde el centro y todo se desvanece
+  let boom = 0;
+  const coreVel = [];
+  Brain.explode = () => {
+    if (boom) return;
+    boom = 0.0001;
+    for (let i = 0; i < CORE; i++) {
+      const d = corePts[i].clone().normalize().multiplyScalar(0.02 + Math.random() * 0.05);
+      coreVel.push(d);
+    }
+    document.querySelectorAll('.ncard').forEach((el) => {
+      el.style.transition = 'transform 1.2s cubic-bezier(.2,.8,.3,1), opacity 1.2s';
+      const a = Math.random() * Math.PI * 2;
+      el.style.transform = `translate(-50%,-120%) translate(${Math.cos(a) * 70}vw, ${Math.sin(a) * 70}vh) rotate(${(Math.random() - 0.5) * 90}deg)`;
+      el.style.opacity = 0;
+    });
+  };
+
   let pulseEnergy = 0;
   Brain.pulse = () => { pulseEnergy = 1; };
   Brain.setNotes = (list) => { buildBranches(list); syncCards(); };
@@ -1118,6 +1181,24 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
     }
     placeCamera();
     coreGroup.rotation.y = t * 0.55; // el mini cerebro gira solo, continuo
+
+    if (boom) { // el cerebro estalla y se apaga
+      boom += 0.016;
+      const arr = coreGeo.attributes.position.array;
+      for (let i = 0; i < CORE; i++) {
+        const v = coreVel[i];
+        arr[i * 3] += v.x; arr[i * 3 + 1] += v.y; arr[i * 3 + 2] += v.z;
+      }
+      coreGeo.attributes.position.needsUpdate = true;
+      const fade = Math.max(0, 1 - boom);
+      coreGroup.children[0].material.opacity = fade * 0.85;
+      coreLineMat.opacity = fade * 0.18;
+      branchMat.opacity = fade * 0.35;
+      nodeMat.opacity = fade; nodeMat.transparent = true;
+      sparkMat.opacity = fade * 0.8;
+      renderer.render(scene, camera);
+      return; // sin proyectar cards: ya salieron volando por CSS
+    }
     // chispas
     if (sparks.length) {
       const arr = sparkGeo.attributes.position.array;
