@@ -155,6 +155,28 @@
   .row { display: flex; gap: .5rem; flex-wrap: wrap; }
   #paste-hint { font-size: .6rem; color: var(--dim); margin-bottom: .6rem; }
 
+  /* ---- panel de dispositivos ---- */
+  #devs {
+    position: fixed; inset: 0; z-index: 45;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.7); backdrop-filter: blur(8px); padding: 1rem;
+  }
+  #devs .sheet {
+    width: min(460px, 94vw); max-height: 84vh; overflow-y: auto;
+    background: var(--bg); border: 1px solid var(--ink); box-shadow: 8px 8px 0 var(--ink);
+    padding: 1.3rem;
+  }
+  #devs h3 { font-size: .78rem; letter-spacing: .18em; text-transform: uppercase; margin-bottom: .7rem; }
+  #devs .hint { font-size: .62rem; color: var(--dim); line-height: 1.7; margin-bottom: 1rem; }
+  #devs-list { list-style: none; margin-bottom: 1rem; }
+  #devs-list li {
+    display: flex; align-items: center; justify-content: space-between; gap: .6rem;
+    border: 1px solid var(--line); padding: .5rem .6rem; margin-bottom: .4rem;
+    font-size: .62rem;
+  }
+  #devs-list .who { display: flex; flex-direction: column; gap: .15rem; }
+  #devs-list .st { color: var(--dim); font-size: .55rem; letter-spacing: .1em; text-transform: uppercase; }
+
   /* ---- diálogo propio (sustituye a confirm() nativo) ---- */
   #ask {
     position: fixed; inset: 0; z-index: 50;
@@ -257,6 +279,7 @@
   <span>sinapsis <b id="peers">0</b></span>
   <span id="net">—</span>
   <button id="share" class="ghost" hidden>enlace secreto</button>
+  <button id="devices" class="ghost" hidden>dispositivos</button>
   <button id="netoggle" class="ghost" hidden>desconectar</button>
   <button id="forget" class="ghost" hidden>salir</button>
 </div>
@@ -310,6 +333,15 @@
         <button id="e-cancel" class="ghost">cancelar</button>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="devs" hidden>
+  <div class="sheet">
+    <h3>dispositivos autorizados</h3>
+    <p class="hint">Estos dispositivos pueden crear y editar notas. Al revocar uno deja de poder escribir; su copia de lo ya sincronizado sigue en su equipo (en P2P no hay borrado a distancia salvo eliminar el cerebro).</p>
+    <ul id="devs-list"></ul>
+    <div class="row"><button id="devs-close" class="ghost">cerrar</button></div>
   </div>
 </div>
 
@@ -776,8 +808,24 @@ function broadcast(msg) {
    no prueba nada) y solo entonces firma un DEVICE_ADD con su pubkey.
    ============================================================ */
 const pendingAuth = new Map(); // pubKey → nonce esperado (lado owner)
+const authRequests = new Set(); // dispositivos revocados que vuelven a pedir permiso
+
+// último veredicto del owner sobre un dispositivo: 'add', 'revoke' o null
+function lastDeviceEvent(pub) {
+  let last = null;
+  const owner = blocks[0]?.payload.ownerPubKey;
+  for (const b of blocks) {
+    if (blockSigner(b, owner) !== owner || b.payload.pubKey !== pub) continue;
+    if (b.type === 'DEVICE_ADD') last = 'add';
+    if (b.type === 'DEVICE_REVOKE') last = 'revoke';
+  }
+  return last;
+}
+const wasRevoked = (pub) => lastDeviceEvent(pub) === 'revoke';
+
 const canWrite = () => Boolean(meta) && (meta.role === 'owner' || (meta.publicKeyHex && writersOf(blocks).has(meta.publicKeyHex)));
-const wantsWrite = () => Boolean(meta?.device) && !canWrite();
+// un dispositivo revocado NO vuelve a pedir solo: la decisión del owner manda
+const wantsWrite = () => Boolean(meta?.device) && !canWrite() && !wasRevoked(meta.publicKeyHex);
 
 function askForWriteAccess(dc) {
   if (!wantsWrite() || !blocks.length) return;
@@ -787,6 +835,15 @@ function askForWriteAccess(dc) {
 async function onAuthReq(dc, pub) {
   if (meta.role !== 'owner' || !/^[0-9a-f]{64}$/.test(pub ?? '')) return;
   if (writersOf(blocks).has(pub)) return; // ya autorizado
+  // revocado antes: no se re-autoriza en automático, lo decide el owner a mano
+  if (wasRevoked(pub)) {
+    if (!authRequests.has(pub)) {
+      authRequests.add(pub);
+      log(`el dispositivo ${pub.slice(0, 6)} (revocado) pide permiso — míralo en "dispositivos"`);
+      if (!$('devs').hidden) paintDevices();
+    }
+    return;
+  }
   const nonce = bytesHex(crypto.getRandomValues(new Uint8Array(16)));
   pendingAuth.set(pub, nonce);
   dc.send(JSON.stringify({ t: 'AUTH_CHALLENGE', pub, box: await Security.encrypt({ nonce }) }));
@@ -805,7 +862,9 @@ async function onAuthProof(m) {
   pendingAuth.delete(m.pub);
   if (writersOf(blocks).has(m.pub)) return;
   await appendOp('DEVICE_ADD', { pubKey: m.pub });
-  log(`dispositivo ${m.pub.slice(0, 4)} autorizado a escribir`);
+  authRequests.delete(m.pub);
+  log(`dispositivo ${m.pub.slice(0, 6)} autorizado a escribir`);
+  if (!$('devs').hidden) paintDevices();
 }
 
 /* ---------- transferencia de blobs por trozos ---------- */
@@ -1006,8 +1065,18 @@ const dropPairingChips = () => document.querySelectorAll('[data-chip^="pair-"]')
 const selfHex = bytesHex(crypto.getRandomValues(new Uint8Array(8)));
 function wire(pc, dc) {
   let key = null; // se fija con el HELLO (id real del peer → dedup de conexiones dobles)
-  dc.onopen = () => dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex }));
-  const gone = () => { if (key && peers.get(key)?.dc === dc) { peers.delete(key); dropChip(key); refresh(); } };
+  const hello = () => JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta?.publicKeyHex });
+  dc.onopen = () => dc.send(hello());
+  const gone = () => {
+    if (key && peers.get(key)?.dc === dc) {
+      const p = peers.get(key);
+      if (p.pub) onlinePubs.delete(p.pub);
+      peers.delete(key);
+      dropChip(key);
+      refresh();
+      if (!$('devs').hidden) paintDevices();
+    }
+  };
   dc.onclose = gone;
   // canal caído sin evento close limpio (iOS suspendido, red cortada)
   pc.onconnectionstatechange = () => { if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) gone(); };
@@ -1028,7 +1097,8 @@ function wire(pc, dc) {
         peers.delete(id);
       }
       key = id;
-      peers.set(key, { pc, dc });
+      peers.set(key, { pc, dc, pub: m.pub });
+      if (m.pub) { onlinePubs.add(m.pub); if (!$('devs').hidden) paintDevices(); }
       // modo lápida: al primer contacto, entregar la sentencia y contar la baja
       if (tombstone) {
         try {
@@ -1098,11 +1168,17 @@ async function refresh(dataChanged) {
   const write = canWrite();
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
-  $('role').textContent = meta.role === 'owner' ? 'owner' : meta.device ? (write ? 'mi dispositivo' : 'esperando permiso') : 'invitado';
+  $('role').textContent = meta.role === 'owner'
+    ? 'owner'
+    : meta.device
+      ? (write ? 'mi dispositivo' : wasRevoked(meta.publicKeyHex) ? 'escritura revocada' : 'esperando permiso')
+      : 'invitado';
   $('add').hidden = $('paste').hidden = !write;
-  $('find').hidden = false;
+  $('find').hidden = false; // buscar y descargar: todos
+  // el invitado solo puede leer, buscar, descargar y salir
   $('share').hidden = meta.role !== 'owner'; // solo el owner reparte enlaces
-  $('netoggle').hidden = false;
+  $('devices').hidden = meta.role !== 'owner';
+  $('netoggle').hidden = !meta.device && meta.role !== 'owner';
   $('forget').hidden = false;
   $('forget').textContent = meta.role === 'owner' ? 'eliminar cerebro' : 'salir';
   updateNet();
@@ -1456,6 +1532,75 @@ $('share').onclick = async () => {
   log(mine ? 'enlace de DISPOSITIVO copiado — solo para tus equipos' : 'enlace de INVITADO copiado — sesión efímera, no recordará nada');
 };
 
+/* ---------- panel de dispositivos (solo owner) ---------- */
+const onlinePubs = new Set(); // pubkeys vistas en las sinapsis actuales
+
+function paintDevices() {
+  const ul = $('devs-list');
+  ul.innerHTML = '';
+  const owner = blocks[0]?.payload.ownerPubKey;
+  const list = [...writersOf(blocks)].filter((p) => p !== owner);
+  // solicitudes de dispositivos revocados que quieren volver
+  for (const pub of authRequests) {
+    if (writersOf(blocks).has(pub)) continue;
+    const li = document.createElement('li');
+    const who = document.createElement('div');
+    who.className = 'who';
+    const name = document.createElement('b');
+    name.textContent = `dispositivo ${pub.slice(0, 6)}`;
+    const st = document.createElement('span');
+    st.className = 'st';
+    st.textContent = 'pide permiso (revocado antes)';
+    who.append(name, st);
+    const ok = document.createElement('button');
+    ok.textContent = 'volver a autorizar';
+    ok.onclick = async () => {
+      await appendOp('DEVICE_ADD', { pubKey: pub });
+      authRequests.delete(pub);
+      log(`dispositivo ${pub.slice(0, 6)} autorizado de nuevo`);
+      paintDevices();
+    };
+    li.append(who, ok);
+    ul.append(li);
+  }
+  if (!list.length && !authRequests.size) {
+    const li = document.createElement('li');
+    li.textContent = 'ninguno todavía — comparte un “enlace de mi dispositivo”';
+    ul.append(li);
+    return;
+  }
+  for (const pub of list) {
+    const li = document.createElement('li');
+    const who = document.createElement('div');
+    who.className = 'who';
+    const name = document.createElement('b');
+    name.textContent = `dispositivo ${pub.slice(0, 6)}`;
+    const st = document.createElement('span');
+    st.className = 'st';
+    st.textContent = onlinePubs.has(pub) ? '● en línea' : '○ desconectado';
+    who.append(name, st);
+    const rv = document.createElement('button');
+    rv.className = 'ghost';
+    rv.textContent = 'revocar';
+    rv.onclick = async () => {
+      const ok = await ask({
+        title: 'revocar dispositivo',
+        msg: `El dispositivo ${pub.slice(0, 6)} dejará de poder crear o editar notas. Seguirá pudiendo leer lo que ya sincronizó.`,
+        options: [{ label: 'revocar escritura', value: true, danger: true }],
+      });
+      if (!ok) return;
+      await appendOp('DEVICE_REVOKE', { pubKey: pub });
+      log(`dispositivo ${pub.slice(0, 6)} revocado`);
+      paintDevices();
+    };
+    li.append(who, rv);
+    ul.append(li);
+  }
+}
+$('devices').onclick = () => { paintDevices(); $('devs').hidden = false; };
+$('devs-close').onclick = () => ($('devs').hidden = true);
+$('devs').onclick = (e) => { if (e.target === $('devs')) $('devs').hidden = true; };
+
 // desconectar/conectar: kill switch de red — corta todas las sinapsis y
 // deja de anunciarse. Las notas siguen usables en local.
 $('netoggle').onclick = () => {
@@ -1500,9 +1645,28 @@ $('forget').onclick = async () => {
   location.reload();
 };
 
-// cerrar/ocultar la pestaña corta la conexión P2P al instante (no dejar
-// sinapsis fantasma vivas en los demás dispositivos)
+// cerrar la pestaña corta la conexión P2P al instante (no dejar sinapsis
+// fantasma vivas en los demás dispositivos)
 addEventListener('pagehide', () => { try { stopP2P(); } catch {} });
+
+// Volver de segundo plano: reanudar YA en vez de esperar el latido y el
+// siguiente anuncio (antes tardaba ~1 min en enterarse de novedades como la
+// muerte del cerebro; iOS congela los canales al minimizar).
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !meta || p2pDown) return;
+  // purgar sinapsis que murieron mientras estábamos dormidos
+  for (const [id, p] of peers) {
+    if (p.dc.readyState !== 'open') { if (p.pub) onlinePubs.delete(p.pub); peers.delete(id); dropChip(id); }
+  }
+  refresh();
+  // reanunciarse ya (y reabrir trackers si el navegador los cerró)
+  if (!sockets.length) TRACKERS.forEach(trackerConnect);
+  else sockets.forEach(announce);
+  // y preguntar a quien siga vivo si hay algo nuevo
+  for (const p of peers.values()) {
+    try { p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta.publicKeyHex })); } catch {}
+  }
+});
 
 /* ---------- arranque ---------- */
 async function enterMain() {
