@@ -390,8 +390,11 @@ function broadcast(msg) {
 }
 
 /* ---------- P2P (trackers WebTorrent, solo señalización) ---------- */
-// varios trackers: basta que AMBOS dispositivos coincidan en uno para encontrarse
+// varios trackers: basta que AMBOS dispositivos coincidan en uno para encontrarse.
+// El primero es NUESTRO (Cloudflare Worker propio) — rápido y siempre disponible;
+// los públicos quedan de respaldo. Ninguno ve datos: solo el apretón de manos.
 const TRACKERS = [
+  'wss://noteschain-tracker.onilabs-dev.workers.dev',
   'wss://tracker.openwebtorrent.com',
   'wss://tracker.webtorrent.dev',
 ];
