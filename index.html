@@ -654,6 +654,14 @@ $('share').onclick = () => {
 async function enterMain() {
   $('setup').hidden = true;
   await Security.importKey(meta.encKey);
+  // auto-reparación: si la réplica local quedó corrupta (p.ej. por un bug
+  // anterior), se descarta y se resincroniza desde la red — nada se pierde,
+  // la cadena buena vive en tus otros dispositivos.
+  if (blocks.length && (await verifyChain(blocks, meta.chainId))) {
+    console.warn('[noteschain] réplica local corrupta — descartada, resincronizando');
+    blocks = [];
+    await dbWrite((tx) => tx.objectStore('blocks').clear());
+  }
   await rebuildNotes();
   Brain.setNotes(notes);
   await refresh();
