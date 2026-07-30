@@ -262,6 +262,7 @@
   #m-view a { color: inherit; text-decoration: underline; word-break: break-all; }
 
   @media (max-width: 640px) {
+    #chips { display: none; }
     #topbar { flex-wrap: wrap; gap: .3rem .8rem; font-size: .56rem; padding: .6rem .8rem; }
     #chips { top: 4.6rem; }
     .ncard { width: 116px; }
@@ -299,6 +300,29 @@
     40%, 60% { transform: translateX(7px); }
   }
   .shaking { animation: shake .5s cubic-bezier(.36,.07,.19,.97) both; }
+
+  /* progreso de transferencia: rectángulo con barra, abajo a la derecha */
+  #xfer {
+    position: fixed; right: 1rem; bottom: 1rem; z-index: 75;
+    width: min(260px, 70vw);
+    background: var(--bg); border: 1px solid var(--ink);
+    box-shadow: 4px 4px 0 var(--ink);
+    padding: .55rem .6rem;
+    animation: toastin .2s cubic-bezier(.2,1.4,.4,1);
+  }
+  #xfer.out { opacity: 0; transition: opacity .5s; }
+  #xfer .row1 {
+    display: flex; justify-content: space-between; gap: .5rem;
+    font-size: .6rem; margin-bottom: .35rem;
+  }
+  #xfer .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #xfer .pct { font-weight: 700; }
+  #xfer .bar { height: 5px; border: 1px solid var(--ink); }
+  #xfer .fill { height: 100%; background: var(--ink); width: 0; transition: width .25s; }
+
+  @media (max-width: 640px) {
+    #xfer { right: .6rem; bottom: 5.2rem; width: min(220px, 62vw); }
+  }
 
   #log {
     position: fixed; left: 1rem; bottom: 1rem; z-index: 70;
@@ -378,7 +402,7 @@
 
 <div id="devs" hidden>
   <div class="sheet">
-    <h3>dispositivos autorizados</h3>
+    <h3 id="devs-title">dispositivos</h3>
     <p class="hint">Estos dispositivos pueden crear y editar notas. Al revocar uno deja de poder escribir; su copia de lo ya sincronizado sigue en su equipo (en P2P no hay borrado a distancia salvo eliminar el cerebro).</p>
     <ul id="devs-list"></ul>
     <div class="row"><button id="devs-close" class="ghost">cerrar</button></div>
@@ -403,6 +427,11 @@
   <p id="dead-msg">El owner eliminó este cerebro. Todas las sinapsis se cortaron y la réplica de este dispositivo fue borrada.</p>
   <div id="tomb-count" hidden></div>
   <button id="dead-ok">entendido</button>
+</div>
+
+<div id="xfer" hidden>
+  <div class="row1"><span class="name" id="xfer-name"></span><span class="pct" id="xfer-pct"></span></div>
+  <div class="bar"><div class="fill" id="xfer-fill"></div></div>
 </div>
 
 <div id="toasts"></div>
@@ -702,7 +731,7 @@ const FRAG = 256 * 1024; // unidad de cifrado, guardado, petición y reanudació
 // 16 KB de ciphertext → ~21 KB de mensaje en base64. Con 48 KB el mensaje
 // rondaba los 64 KB y Safari/iOS los descarta en silencio (los archivos del
 // iPhone nunca llegaban).
-const CHUNK = 16 * 1024;
+const CHUNK = 32 * 1024; // en binario cabe más por mensaje que en base64
 const memBlobs = new Map(); // sesión efímera (invitado): blobs solo en memoria
 
 const bufHashHex = async (buf) => bytesHex(await crypto.subtle.digest('SHA-256', buf));
@@ -825,6 +854,30 @@ async function blobUrl(f) {
 }
 
 const notesFiles = () => notes.flatMap((n) => n.files ?? []);
+
+// barra de progreso de la transferencia en curso (la que menos le falta)
+let xferHide = null;
+function paintTransfer() {
+  const pend = notesFiles().filter((f) => !fileReady(f));
+  const box = $('xfer');
+  if (!pend.length) {
+    if (!box.hidden && !xferHide) {
+      $('xfer-pct').textContent = '100%';
+      $('xfer-fill').style.width = '100%';
+      box.classList.add('out');
+      xferHide = setTimeout(() => { box.hidden = true; box.classList.remove('out'); xferHide = null; }, 900);
+    }
+    return;
+  }
+  clearTimeout(xferHide); xferHide = null;
+  box.classList.remove('out');
+  const f = pend.sort((a, b) => fileProgress(b) - fileProgress(a))[0];
+  const pct = Math.round(fileProgress(f) * 100);
+  $('xfer-name').textContent = pend.length > 1 ? `${f.name} (+${pend.length - 1})` : f.name;
+  $('xfer-pct').textContent = `${pct}%`;
+  $('xfer-fill').style.width = `${pct}%`;
+  box.hidden = false;
+}
 const isImage = (f) => (f.type || '').startsWith('image/');
 const prettySize = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(0)} KB` : `${(b / 1048576).toFixed(1)} MB`);
 
@@ -1010,10 +1063,11 @@ const wantsWrite = () => Boolean(meta?.device) && !canWrite() && !wasRevoked(met
 
 function askForWriteAccess(dc) {
   if (!wantsWrite() || !blocks.length) return;
-  try { dc.send(JSON.stringify({ t: 'AUTH_REQ', pub: meta.publicKeyHex })); } catch {}
+  try { dc.send(JSON.stringify({ t: 'AUTH_REQ', pub: meta.publicKeyHex, name: deviceLabel() })); } catch {}
 }
 
-async function onAuthReq(dc, pub) {
+async function onAuthReq(dc, pub, name) {
+  if (name) deviceNames.set(pub, name);
   if (!isOwner() || !/^[0-9a-f]{64}$/.test(pub ?? '')) return;
   if (writersOf(blocks).has(pub)) return; // ya autorizado
   // revocado antes: no se re-autoriza en automático, lo decide el owner a mano
@@ -1053,30 +1107,34 @@ async function onAuthProof(m) {
 const incoming = new Map(); // hash → { iv, chunks[], total, got, ts }
 const asking = new Map(); // hash → cuándo se pidió (para reintentar)
 const ASK_RETRY = 12_000;
-const STALL_MS = 25_000;
+const STALL_MS = 45_000;
 
 // Pide los archivos que las notas referencian y no tengo. Reintenta: antes,
 // si la petición se perdía (peer suspendido, canal muerto) el archivo se
 // quedaba "recibiendo…" para siempre.
-const MAX_PARALLEL = 6; // fragmentos en vuelo a la vez
+const MAX_PARALLEL = 12; // fragmentos en vuelo a la vez
 
 // Pide los fragmentos que faltan REPARTIÉNDOLOS entre las sinapsis: con dos
 // dispositivos que ya tienen el archivo, se descarga al doble de velocidad.
-async function requestMissingBlobs() {
+function requestMissingBlobs() {
   const dcs = [...peers.values()].filter((p) => p.dc?.readyState === 'open').map((p) => p.dc);
   if (!dcs.length) return;
   const now = Date.now();
   let inFlight = incoming.size;
   let turn = 0;
-  for (const f of notesFiles()) {
-    for (const h of partsOf(f)) {
-      if (inFlight >= MAX_PARALLEL) return;
-      if (blobReady.has(h) || (await hasBlob(h))) { asking.delete(h); continue; }
-      if (incoming.has(h)) continue; // ya viene en camino
-      if (now - (asking.get(h) ?? 0) < ASK_RETRY) continue;
+  // Ronda entre ARCHIVOS: así varias notas avanzan a la vez en vez de que el
+  // primer archivo grande acapare toda la cola.
+  const pending = notesFiles()
+    .map((f) => partsOf(f).filter((h) => !blobReady.has(h) && !incoming.has(h) && now - (asking.get(h) ?? 0) >= ASK_RETRY))
+    .filter((l) => l.length);
+  for (let round = 0; inFlight < MAX_PARALLEL && pending.some((l) => l.length); round++) {
+    for (const list of pending) {
+      if (inFlight >= MAX_PARALLEL) break;
+      const h = list.shift();
+      if (!h) continue;
       asking.set(h, now);
       inFlight++;
-      // a un peer distinto por fragmento (rota); si no lo tiene responde BLOB_MISS
+      // un peer distinto por fragmento: con varias fuentes, descarga en paralelo
       const dc = dcs[turn++ % dcs.length];
       try { dc.send(JSON.stringify({ t: 'GET_BLOB', hash: h })); } catch {}
     }
@@ -1091,31 +1149,91 @@ function sweepStalledBlobs() {
   }
 }
 
-async function sendBlob(dc, hash) {
-  const rec = await getBlobRec(hash);
-  if (!rec) { try { dc.send(JSON.stringify({ t: 'BLOB_MISS', hash })); } catch {} return; }
-  const ct = new Uint8Array(rec.ct);
-  const chunks = Math.ceil(ct.length / CHUNK);
-  dc.send(JSON.stringify({ t: 'BLOB_START', hash, iv: b64(rec.iv), chunks }));
-  for (let i = 0; i < chunks; i++) {
-    // backpressure: no ahogar el canal (se cerraría por buffer lleno)
-    while (dc.readyState === 'open' && dc.bufferedAmount > 512 * 1024) await new Promise((r) => setTimeout(r, 60));
-    if (dc.readyState !== 'open') return;
-    dc.send(JSON.stringify({ t: 'BLOB_CHUNK', hash, i, d: b64(ct.subarray(i * CHUNK, (i + 1) * CHUNK)) }));
+// Los trozos van en BINARIO (no en JSON+base64): un tercio menos de bytes y
+// sin el coste de codificar/decodificar. Cabecera: 32 bytes de hash + índice.
+const HDR = 36;
+const BUF_HIGH = 4 * 1024 * 1024;
+const BUF_LOW = 512 * 1024;
+
+/* Emisor dirigido por EVENTOS del canal, no por bucles con esperas: en una
+   pestaña de fondo el navegador congela temporizadores y promesas, y la
+   transferencia se quedaba parada durante minutos. Aquí se envía todo lo que
+   quepa hasta llenar el buffer y se continúa cuando el canal avisa que se ha
+   vaciado (bufferedamountlow). */
+const senders = new Map(); // dc → { queue:[hash], cur:null, busy:false }
+
+function sender(dc) {
+  let s = senders.get(dc);
+  if (!s) {
+    s = { queue: [], cur: null, busy: false };
+    senders.set(dc, s);
+    dc.bufferedAmountLowThreshold = BUF_LOW;
+    dc.addEventListener('bufferedamountlow', () => pump(dc));
+    dc.addEventListener('close', () => senders.delete(dc));
   }
+  return s;
+}
+
+function queueSend(dc, hash) {
+  const s = sender(dc);
+  if (s.queue.length > 64) return; // no acumular peticiones sin fin
+  s.queue.push(hash);
+  pump(dc);
+}
+
+async function pump(dc) {
+  const s = sender(dc);
+  if (s.busy || dc.readyState !== 'open') return;
+  s.busy = true;
+  try {
+    while (dc.readyState === 'open') {
+      if (!s.cur) {
+        const hash = s.queue.shift();
+        if (!hash) break;
+        const rec = await getBlobRec(hash);
+        if (!rec) { try { dc.send(JSON.stringify({ t: 'BLOB_MISS', hash })); } catch {} continue; }
+        const ct = new Uint8Array(rec.ct);
+        s.cur = { hash, ct, id: hexBytes(hash), i: 0, chunks: Math.ceil(ct.length / CHUNK) };
+        dc.send(JSON.stringify({ t: 'BLOB_START', hash, iv: b64(rec.iv), chunks: s.cur.chunks, bytes: ct.length }));
+      }
+      const c = s.cur;
+      // enviar mientras el canal tenga sitio; al llenarse, seguirá el evento
+      while (c.i < c.chunks && dc.bufferedAmount < BUF_HIGH) {
+        const part = c.ct.subarray(c.i * CHUNK, (c.i + 1) * CHUNK);
+        const msg = new Uint8Array(HDR + part.length);
+        msg.set(c.id, 0);
+        new DataView(msg.buffer).setUint32(32, c.i);
+        msg.set(part, HDR);
+        dc.send(msg.buffer);
+        c.i++;
+      }
+      if (c.i >= c.chunks) { s.cur = null; continue; } // fragmento enviado
+      break; // buffer lleno: esperamos al evento del canal
+    }
+  } catch {
+    s.cur = null;
+  } finally {
+    s.busy = false;
+  }
+}
+
+// trozo binario entrante: cabecera (hash + índice) y el resto son datos
+function onBinaryChunk(buf) {
+  const u = new Uint8Array(buf);
+  if (u.length <= HDR) return;
+  const hash = bytesHex(u.subarray(0, 32));
+  const i = new DataView(buf).getUint32(32);
+  onBlobChunk({ hash, i, bin: u.slice(HDR) });
 }
 
 async function onBlobChunk(m) {
   const st = incoming.get(m.hash);
   if (!st) return;
   if (st.chunks[m.i]) return; // trozo repetido (dos peers respondieron)
-  st.chunks[m.i] = unb64(m.d);
+  st.chunks[m.i] = m.bin ?? unb64(m.d);
   st.got++;
   st.ts = Date.now(); // sigue vivo: no lo barras
-  if (st.got < st.total) {
-    if (st.total > 8 && st.got % 8 === 0) log(`recibiendo archivo… ${Math.round((st.got / st.total) * 100)}%`);
-    return;
-  }
+  if (st.got < st.total) return;
   incoming.delete(m.hash);
   // reensamblar el ciphertext y comprobar que el contenido es EL pedido
   const size = st.chunks.reduce((a, c) => a + c.length, 0);
@@ -1130,6 +1248,7 @@ async function onBlobChunk(m) {
     asking.delete(m.hash);
     urlCache.delete(m.hash);
     requestMissingBlobs(); // pedir ya el siguiente: mantener la tubería llena
+    paintTransfer();
     if (notesFiles().some((f) => fileReady(f) && partsOf(f).includes(m.hash))) toast('Archivo recibido y verificado.');
     renderAll();
   } catch { fail('Archivo descartado: no se pudo descifrar con la llave de este cerebro.'); }
@@ -1280,7 +1399,7 @@ const dropPairingChips = () => document.querySelectorAll('[data-chip^="pair-"]')
 const selfHex = bytesHex(crypto.getRandomValues(new Uint8Array(8)));
 function wire(pc, dc) {
   let key = null; // se fija con el HELLO (id real del peer → dedup de conexiones dobles)
-  const hello = () => JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta?.publicKeyHex });
+  const hello = () => JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta?.publicKeyHex, name: deviceLabel() });
   dc.onopen = () => dc.send(hello());
   const gone = () => {
     if (key && peers.get(key)?.dc === dc) {
@@ -1295,7 +1414,9 @@ function wire(pc, dc) {
   dc.onclose = gone;
   // canal caído sin evento close limpio (iOS suspendido, red cortada)
   pc.onconnectionstatechange = () => { if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) gone(); };
+  dc.binaryType = 'arraybuffer';
   dc.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) return onBinaryChunk(ev.data); // trozo de archivo
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.t === 'HELLO') {
       const id = m.id ?? randBin(20);
@@ -1315,6 +1436,7 @@ function wire(pc, dc) {
       peers.set(key, { pc, dc, pub: m.pub });
       if (m.pub) {
         onlinePubs.add(m.pub);
+        if (m.name) deviceNames.set(m.pub, m.name);
         if (m.pub === authorityOf(blocks).owner) ownerSeenAt = Date.now();
         if (!$('devs').hidden) paintDevices();
       }
@@ -1330,7 +1452,7 @@ function wire(pc, dc) {
         return;
       }
       dropPairingChips();
-      chip(key, `dispositivo ${id.slice(0, 4)} · en línea`);
+      chip(key, `${m.name ?? 'dispositivo'} · en línea`);
       log('sinapsis establecida — P2P directo cifrado');
       refresh();
       if (m.height > blocks.length) dc.send(JSON.stringify({ t: 'GET_BLOCKS' }));
@@ -1348,10 +1470,10 @@ function wire(pc, dc) {
     }
     else if (m.t === 'BLOCKS') { if (!tombstone) enqueue(() => adoptChain(m.blocks)); }
     else if (m.t === 'NEW_BLOCK') { if (!tombstone) enqueue(() => receiveBlock(m.block, dc)); }
-    else if (m.t === 'AUTH_REQ') enqueue(() => onAuthReq(dc, m.pub));
+    else if (m.t === 'AUTH_REQ') enqueue(() => onAuthReq(dc, m.pub, m.name));
     else if (m.t === 'AUTH_CHALLENGE') enqueue(() => onAuthChallenge(dc, m));
     else if (m.t === 'AUTH_PROOF') enqueue(() => onAuthProof(m));
-    else if (m.t === 'GET_BLOB') { if (!tombstone) sendBlob(dc, m.hash); }
+    else if (m.t === 'GET_BLOB') { if (!tombstone) queueSend(dc, m.hash); }
     else if (m.t === 'BLOB_START') {
       // ignorar si ya lo tengo o ya está llegando de otro peer
       if (!blobReady.has(m.hash) && !incoming.has(m.hash))
@@ -1368,7 +1490,7 @@ setInterval(() => {
   for (const [id, p] of peers) {
     if (p.dc.readyState !== 'open') { peers.delete(id); dropChip(id); refresh(); continue; }
     try {
-      p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta?.publicKeyHex }));
+      p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta?.publicKeyHex, name: deviceLabel() }));
       askForWriteAccess(p.dc); // reintentar: el owner pudo no estar online al conectar
     } catch { peers.delete(id); dropChip(id); refresh(); }
   }
@@ -1390,6 +1512,7 @@ const renderAll = () => { syncCards(); if (!$('modal').hidden && viewingId) open
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); requestMissingBlobs(); }
   syncBlobAvailability(); // también al arrancar: los blobs están en disco pero no en memoria
+  paintTransfer();
   const write = canWrite();
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
@@ -1402,7 +1525,7 @@ async function refresh(dataChanged) {
   $('find').hidden = false; // buscar y descargar: todos
   // el invitado solo puede leer, buscar, descargar y salir
   $('share').hidden = !isOwner(); // solo el owner reparte enlaces
-  $('devices').hidden = !isOwner();
+  $('devices').hidden = false; // todos pueden ver quién está conectado
   $('netoggle').hidden = !meta.device && !isOwner();
   $('forget').hidden = false;
   $('forget').textContent = isOwner() ? 'eliminar cerebro' : 'salir';
@@ -1778,6 +1901,28 @@ let readyTransfer = null; // bloque de traspaso pre-firmado (para poder enviarlo
 
 const myPub = () => meta?.publicKeyHex ?? blocks[0]?.payload.ownerPubKey ?? '';
 
+// nombre reconocible del dispositivo (iPhone, Mac, Windows…) en vez de un hash
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const plat = navigator.userAgentData?.platform ?? '';
+  const touch = navigator.maxTouchPoints > 1;
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/iPad/.test(ua) || (/Macintosh/.test(ua) && touch)) return 'iPad';
+  if (/Android/.test(ua)) return /Mobile/.test(ua) ? 'Android' : 'Tablet Android';
+  if (/Macintosh|Mac OS X/.test(ua) || /macOS/i.test(plat)) return 'Mac';
+  if (/Windows/.test(ua) || /Windows/i.test(plat)) return 'Windows';
+  if (/CrOS/.test(ua)) return 'Chromebook';
+  if (/Linux/.test(ua)) return 'Linux';
+  return 'Dispositivo';
+}
+const deviceNames = new Map(); // pubKey → nombre legible (llega en el saludo)
+const nameFor = (pub) => {
+  const short = pub.slice(0, 4);
+  const base = deviceNames.get(pub);
+  const mine = pub === myPub() ? ' · este dispositivo' : '';
+  return `${base ?? 'dispositivo'} ${short}${mine}`;
+};
+
 // testamento: los dispositivos autorizados, en orden de antigüedad
 async function updateSuccession() {
   if (!isOwner() || !blocks.length) return;
@@ -1846,8 +1991,9 @@ const onlinePubs = new Set(); // pubkeys vistas en las sinapsis actuales
 function paintDevices() {
   const ul = $('devs-list');
   ul.innerHTML = '';
-  const owner = blocks[0]?.payload.ownerPubKey;
-  const list = [...writersOf(blocks)].filter((p) => p !== owner);
+  const owner = authorityOf(blocks).owner; // el owner VIGENTE, no el del génesis
+  $('devs-title').textContent = isOwner() ? 'dispositivos autorizados' : 'dispositivos del cerebro';
+  const list = [owner, ...[...writersOf(blocks)].filter((p) => p !== owner)].filter(Boolean);
   // solicitudes de dispositivos revocados que quieren volver
   for (const pub of authRequests) {
     if (writersOf(blocks).has(pub)) continue;
@@ -1855,7 +2001,7 @@ function paintDevices() {
     const who = document.createElement('div');
     who.className = 'who';
     const name = document.createElement('b');
-    name.textContent = `dispositivo ${pub.slice(0, 6)}`;
+    name.textContent = nameFor(pub);
     const st = document.createElement('span');
     st.className = 'st';
     st.textContent = 'pide permiso (revocado antes)';
@@ -1883,11 +2029,16 @@ function paintDevices() {
     const who = document.createElement('div');
     who.className = 'who';
     const name = document.createElement('b');
-    name.textContent = `dispositivo ${pub.slice(0, 6)}`;
+    name.textContent = nameFor(pub);
     const st = document.createElement('span');
     st.className = 'st';
-    st.textContent = onlinePubs.has(pub) ? '● en línea' : '○ desconectado';
+    const quien = pub === owner ? 'custodia' : 'escritura';
+    st.textContent = pub === myPub()
+      ? `● este dispositivo · ${quien}`
+      : `${onlinePubs.has(pub) ? '●' : '○'} ${onlinePubs.has(pub) ? 'en línea' : 'desconectado'} · ${quien}`;
     who.append(name, st);
+    li.append(who);
+    if (!isOwner() || pub === myPub()) { ul.append(li); continue; } // solo el owner revoca
     const rv = document.createElement('button');
     rv.className = 'ghost';
     rv.textContent = 'revocar';
@@ -1903,7 +2054,7 @@ function paintDevices() {
       toast(`Dispositivo ${pub.slice(0, 6)} revocado.`);
       paintDevices();
     };
-    li.append(who, rv);
+    li.append(rv);
     ul.append(li);
   }
 }
@@ -1997,7 +2148,7 @@ document.addEventListener('visibilitychange', () => {
   else sockets.forEach(announce);
   // y preguntar a quien siga vivo si hay algo nuevo
   for (const p of peers.values()) {
-    try { p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta.publicKeyHex })); } catch {}
+    try { p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta.publicKeyHex, name: deviceLabel() })); } catch {}
   }
   sweepStalledBlobs();
   asking.clear(); // al volver, reintentar ya los archivos pendientes
