@@ -588,7 +588,10 @@ const dbWrite = async (fn) => {
    Cada blob se guarda CIFRADO y se verifica por el hash de su contenido claro.
    ============================================================ */
 const MAX_FILE = 60 * 1024 * 1024; // 60 MB por archivo (vídeos cortos incluidos)
-const CHUNK = 48 * 1024; // bytes de ciphertext por mensaje
+// 16 KB de ciphertext → ~21 KB de mensaje en base64. Con 48 KB el mensaje
+// rondaba los 64 KB y Safari/iOS los descarta en silencio (los archivos del
+// iPhone nunca llegaban).
+const CHUNK = 16 * 1024;
 const memBlobs = new Map(); // sesión efímera (invitado): blobs solo en memoria
 
 const bufHashHex = async (buf) => bytesHex(await crypto.subtle.digest('SHA-256', buf));
@@ -868,23 +871,39 @@ async function onAuthProof(m) {
 }
 
 /* ---------- transferencia de blobs por trozos ---------- */
-const incoming = new Map(); // hash → { iv, chunks[], total, got }
-const asking = new Set(); // hashes ya pedidos (no duplicar peticiones)
+const incoming = new Map(); // hash → { iv, chunks[], total, got, ts }
+const asking = new Map(); // hash → cuándo se pidió (para reintentar)
+const ASK_RETRY = 12_000;
+const STALL_MS = 25_000;
 
-// pide a cualquier sinapsis los archivos que las notas referencian y no tengo
+// Pide los archivos que las notas referencian y no tengo. Reintenta: antes,
+// si la petición se perdía (peer suspendido, canal muerto) el archivo se
+// quedaba "recibiendo…" para siempre.
 async function requestMissingBlobs() {
   const dcs = [...peers.values()].filter((p) => p.dc?.readyState === 'open').map((p) => p.dc);
   if (!dcs.length) return;
+  const now = Date.now();
   for (const f of notesFiles()) {
-    if (asking.has(f.hash) || (await hasBlob(f.hash))) continue;
-    asking.add(f.hash);
-    dcs[0].send(JSON.stringify({ t: 'GET_BLOB', hash: f.hash }));
+    if (await hasBlob(f.hash)) { asking.delete(f.hash); continue; }
+    if (incoming.has(f.hash)) continue; // ya está llegando
+    if (now - (asking.get(f.hash) ?? 0) < ASK_RETRY) continue;
+    asking.set(f.hash, now);
+    // a todas las sinapsis: el que lo tenga responde, el que no dice BLOB_MISS
+    for (const dc of dcs) { try { dc.send(JSON.stringify({ t: 'GET_BLOB', hash: f.hash })); } catch {} }
+  }
+}
+
+// transferencias que se quedaron a medias (el emisor desapareció) → reintentar
+function sweepStalledBlobs() {
+  const now = Date.now();
+  for (const [hash, st] of incoming) {
+    if (now - st.ts > STALL_MS) { incoming.delete(hash); asking.delete(hash); log('reintentando archivo interrumpido'); }
   }
 }
 
 async function sendBlob(dc, hash) {
   const rec = await getBlobRec(hash);
-  if (!rec) return;
+  if (!rec) { try { dc.send(JSON.stringify({ t: 'BLOB_MISS', hash })); } catch {} return; }
   const ct = new Uint8Array(rec.ct);
   const chunks = Math.ceil(ct.length / CHUNK);
   dc.send(JSON.stringify({ t: 'BLOB_START', hash, iv: b64(rec.iv), chunks }));
@@ -899,9 +918,14 @@ async function sendBlob(dc, hash) {
 async function onBlobChunk(m) {
   const st = incoming.get(m.hash);
   if (!st) return;
+  if (st.chunks[m.i]) return; // trozo repetido (dos peers respondieron)
   st.chunks[m.i] = unb64(m.d);
   st.got++;
-  if (st.got < st.total) return;
+  st.ts = Date.now(); // sigue vivo: no lo barras
+  if (st.got < st.total) {
+    if (st.total > 8 && st.got % 8 === 0) log(`recibiendo archivo… ${Math.round((st.got / st.total) * 100)}%`);
+    return;
+  }
   incoming.delete(m.hash);
   // reensamblar el ciphertext y comprobar que el contenido es EL pedido
   const size = st.chunks.reduce((a, c) => a + c.length, 0);
@@ -1133,8 +1157,12 @@ function wire(pc, dc) {
     else if (m.t === 'AUTH_CHALLENGE') enqueue(() => onAuthChallenge(dc, m));
     else if (m.t === 'AUTH_PROOF') enqueue(() => onAuthProof(m));
     else if (m.t === 'GET_BLOB') { if (!tombstone) sendBlob(dc, m.hash); }
-    else if (m.t === 'BLOB_START') incoming.set(m.hash, { iv: m.iv, chunks: new Array(m.chunks), total: m.chunks, got: 0 });
-    else if (m.t === 'BLOB_CHUNK') enqueue(() => onBlobChunk(m));
+    else if (m.t === 'BLOB_START') {
+      // ignorar si ya lo tengo o ya está llegando de otro peer
+      if (!blobReady.has(m.hash) && !incoming.has(m.hash))
+        incoming.set(m.hash, { iv: m.iv, chunks: new Array(m.chunks), total: m.chunks, got: 0, ts: Date.now() });
+    } else if (m.t === 'BLOB_CHUNK') enqueue(() => onBlobChunk(m));
+    else if (m.t === 'BLOB_MISS') asking.delete(m.hash); // ese peer no lo tiene: reintentar con otro
   };
 }
 
@@ -1145,10 +1173,12 @@ setInterval(() => {
   for (const [id, p] of peers) {
     if (p.dc.readyState !== 'open') { peers.delete(id); dropChip(id); refresh(); continue; }
     try {
-      p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex }));
+      p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta?.publicKeyHex }));
       askForWriteAccess(p.dc); // reintentar: el owner pudo no estar online al conectar
     } catch { peers.delete(id); dropChip(id); refresh(); }
   }
+  sweepStalledBlobs();
+  requestMissingBlobs(); // reintento periódico de los archivos que faltan
 }, 10_000);
 
 /* ---------- UI: estado y cards ---------- */
@@ -1666,6 +1696,9 @@ document.addEventListener('visibilitychange', () => {
   for (const p of peers.values()) {
     try { p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex, pub: meta.publicKeyHex })); } catch {}
   }
+  sweepStalledBlobs();
+  asking.clear(); // al volver, reintentar ya los archivos pendientes
+  requestMissingBlobs();
 });
 
 /* ---------- arranque ---------- */
