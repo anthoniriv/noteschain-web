@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>NotesChain</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9B%93%3C/text%3E%3C/svg%3E" />
 <style>
   /* Tema: main BLANCO, tinta negra. */
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -354,6 +355,7 @@ async function adoptChain(cand) {
 async function receiveBlock(block, from) {
   const tip = blocks[blocks.length - 1] ?? null;
   const owner = blocks[0]?.payload.ownerPubKey;
+  if (blocks[block.index]?.hash === block.hash) return; // ya lo tenemos (eco de gossip)
   if (!owner || !tip || block.index !== tip.index + 1) return from?.send(JSON.stringify({ t: 'GET_BLOCKS' }));
   const err = await verifyBlock(block, tip, owner);
   if (err) return log(`bloque rechazado: ${err}`);
@@ -368,7 +370,8 @@ function broadcast(msg) {
 }
 
 /* ---------- P2P (trackers WebTorrent, solo señalización) ---------- */
-const TRACKERS = ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev', 'wss://tracker.btorrent.xyz', 'wss://tracker.files.fm:7073/announce'];
+// solo trackers vivos verificados — los muertos ensucian el console y frenan
+const TRACKERS = ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev'];
 const RTC = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }] };
 const randBin = (n) => String.fromCharCode(...crypto.getRandomValues(new Uint8Array(n)).map((b) => b % 128));
 const selfId = randBin(20);
@@ -377,7 +380,9 @@ let infoHash = '', pending = new Map(), sockets = [];
 async function startP2P() {
   infoHash = String.fromCharCode(...hexBytes(await Security.topic(meta.encKey)));
   TRACKERS.forEach(trackerConnect);
-  setInterval(() => sockets.forEach(announce), 50_000);
+  // sin sinapsis: anunciar agresivo (12s) para emparejar rápido; con sinapsis: cada minuto
+  let tick = 0;
+  setInterval(() => { tick++; if (!peers.size || tick % 5 === 0) sockets.forEach(announce); }, 12_000);
 }
 function trackerConnect(url) {
   let ws; try { ws = new WebSocket(url); } catch { return; }
@@ -435,16 +440,32 @@ const ice = (pc) => new Promise((res) => {
   const t = setTimeout(res, 2500);
   pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } };
 });
-function wire(pc, dc, knownId) {
-  const id = knownId ?? randBin(20);
-  dc.onopen = () => { peers.set(id, { pc, dc }); log('sinapsis establecida — P2P directo cifrado'); dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length })); refresh(); };
-  dc.onclose = () => { peers.delete(id); refresh(); };
-  dc.onmessage = async (ev) => {
+// Los mensajes de cadena se procesan EN SERIE: evita la carrera donde dos
+// NEW_BLOCK simultáneos pasaban la validación a la vez y duplicaban bloques.
+let rxSeq = Promise.resolve();
+const enqueue = (fn) => { rxSeq = rxSeq.then(fn).catch((e) => console.warn('[noteschain]', e)); };
+
+const selfHex = bytesHex(crypto.getRandomValues(new Uint8Array(8)));
+function wire(pc, dc) {
+  let key = null; // se fija con el HELLO (id real del peer → dedup de conexiones dobles)
+  dc.onopen = () => dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex }));
+  dc.onclose = () => { if (key) { peers.delete(key); refresh(); } };
+  dc.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
-    if (m.t === 'HELLO' && m.height > blocks.length) dc.send(JSON.stringify({ t: 'GET_BLOCKS' }));
-    else if (m.t === 'GET_BLOCKS') dc.send(JSON.stringify({ t: 'BLOCKS', blocks }));
-    else if (m.t === 'BLOCKS') await adoptChain(m.blocks);
-    else if (m.t === 'NEW_BLOCK') await receiveBlock(m.block, dc);
+    if (m.t === 'HELLO') {
+      const id = m.id ?? randBin(20);
+      if (id === selfHex || (peers.has(id) && peers.get(id).dc !== dc)) {
+        try { dc.close(); pc.close(); } catch {} // duplicado o eco: una sinapsis por dispositivo
+        return;
+      }
+      key = id;
+      peers.set(key, { pc, dc });
+      log('sinapsis establecida — P2P directo cifrado');
+      refresh();
+      if (m.height > blocks.length) dc.send(JSON.stringify({ t: 'GET_BLOCKS' }));
+    } else if (m.t === 'GET_BLOCKS') dc.send(JSON.stringify({ t: 'BLOCKS', blocks }));
+    else if (m.t === 'BLOCKS') enqueue(() => adoptChain(m.blocks));
+    else if (m.t === 'NEW_BLOCK') enqueue(() => receiveBlock(m.block, dc));
   };
 }
 
@@ -454,7 +475,7 @@ function updateNet() {
 }
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); }
-  $('height').textContent = blocks.length;
+  $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
   $('role').textContent = meta.role === 'owner' ? 'owner' : 'lector';
   $('add').hidden = meta.role !== 'owner';
@@ -563,6 +584,24 @@ function resizeImage(file, max) {
     img.src = URL.createObjectURL(file);
   });
 }
+
+// ⌘V / Ctrl+V FUERA del editor → crea la nota directamente (texto o imagen)
+window.addEventListener('paste', async (e) => {
+  if (!meta || meta.role !== 'owner') return;
+  if (!$('modal').hidden || !$('spot').hidden || !$('setup').hidden) return; // dentro de un editor: pegado nativo
+  const imgItem = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith('image/'));
+  let data = null;
+  if (imgItem) {
+    data = { title: 'Imagen ' + new Date().toLocaleTimeString(), content: '', image: await resizeImage(imgItem.getAsFile(), 900) };
+  } else {
+    const text = e.clipboardData?.getData('text') ?? '';
+    if (!text.trim()) return;
+    const firstLine = text.trim().split('\n')[0].slice(0, 48);
+    data = { title: firstLine, content: text, image: null };
+  }
+  await appendOp('NOTE_ADD', { noteId: crypto.randomUUID(), enc: await Security.encrypt(data) });
+  log('nota creada al pegar — nueva neurona');
+});
 
 /* ---------- spotlight (⌘F / Ctrl+F / ⌘K) ---------- */
 let spotSel = 0, spotHits = [];
@@ -686,28 +725,40 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   });
   canvas.addEventListener('wheel', (e) => { e.preventDefault(); radius = Math.min(11, Math.max(3.2, radius + e.deltaY * 0.005)); }, { passive: false });
 
-  // núcleo: nube de puntos elipsoidal (el "cerebro" central)
-  const CORE = 360;
+  // mini cerebro 3D central: compacto, denso, girando sobre su propio eje
+  // (punto de partida de todas las ramas — como un cerebro en rotación continua)
+  const ink = 0x000000;
+  const coreGroup = new T.Group();
+  scene.add(coreGroup);
+  const CORE = 420;
   const corePos = new Float32Array(CORE * 3);
+  const corePts = [];
   for (let i = 0; i < CORE; i++) {
     let x, y, z;
     do { x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1; } while (x * x + y * y + z * z > 1);
-    corePos.set([x * 1.05 + Math.sign(x) * 0.18, y * 0.8, z * 0.7], i * 3);
+    // dos hemisferios con surco central + achatado: silueta de cerebro
+    const p = new T.Vector3((x * 0.62 + Math.sign(x) * 0.10) * 1.15, y * 0.5 + 0.04 * Math.sin(x * 6), z * 0.42);
+    corePos.set([p.x, p.y, p.z], i * 3);
+    corePts.push(p);
   }
   const coreGeo = new T.BufferGeometry();
   coreGeo.setAttribute('position', new T.BufferAttribute(corePos, 3));
-  const ink = 0x000000;
-  scene.add(new T.Points(coreGeo, new T.PointsMaterial({ color: ink, size: 0.03, transparent: true, opacity: 0.75 })));
-  // conexiones internas del núcleo
+  coreGroup.add(new T.Points(coreGeo, new T.PointsMaterial({ color: ink, size: 0.028, transparent: true, opacity: 0.85 })));
+  // circunvoluciones: cada punto conectado a su vecino más cercano
   const cLines = [];
-  for (let i = 0; i < CORE; i += 3) {
-    const j = (i + 7) % CORE;
-    cLines.push(...corePos.slice(i * 3, i * 3 + 3), ...corePos.slice(j * 3, j * 3 + 3));
+  for (let i = 0; i < CORE; i++) {
+    let best = -1, bd = Infinity;
+    for (let j = 0; j < CORE; j++) {
+      if (i === j) continue;
+      const d = corePts[i].distanceToSquared(corePts[j]);
+      if (d < bd) { bd = d; best = j; }
+    }
+    if (best > i) cLines.push(corePts[i].x, corePts[i].y, corePts[i].z, corePts[best].x, corePts[best].y, corePts[best].z);
   }
   const clGeo = new T.BufferGeometry();
   clGeo.setAttribute('position', new T.BufferAttribute(new Float32Array(cLines), 3));
-  const coreLineMat = new T.LineBasicMaterial({ color: ink, transparent: true, opacity: 0.06 });
-  scene.add(new T.LineSegments(clGeo, coreLineMat));
+  const coreLineMat = new T.LineBasicMaterial({ color: ink, transparent: true, opacity: 0.18 });
+  coreGroup.add(new T.LineSegments(clGeo, coreLineMat));
 
   // ramas por nota
   const group = new T.Group();
@@ -728,7 +779,7 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
       const dir = new T.Vector3(Math.sin(ph) * Math.cos(th), Math.cos(ph) * 0.85, Math.sin(ph) * Math.sin(th)).normalize();
       const tip = dir.clone().multiplyScalar(2.5 + (i % 3) * 0.35);
       const mid = dir.clone().multiplyScalar(1.4).add(new T.Vector3((Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 0.7));
-      const curve = new T.QuadraticBezierCurve3(dir.clone().multiplyScalar(0.9), mid, tip);
+      const curve = new T.QuadraticBezierCurve3(dir.clone().multiplyScalar(0.72), mid, tip); // nace en la superficie del mini cerebro
       const pts = curve.getPoints(24);
       const lgeo = new T.BufferGeometry().setFromPoints(pts);
       const line = new T.Line(lgeo, branchMat);
@@ -747,7 +798,8 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
     if (sparkPts) scene.remove(sparkPts);
     sparks = [];
     const per = branches.length ? Math.max(1, Math.floor(26 / branches.length)) : 0;
-    for (const b of branches) for (let k = 0; k < per; k++) sparks.push({ curve: b.curve, t: Math.random(), v: 0.004 + Math.random() * 0.008 });
+    // pálpito: la chispa va del cerebro a la neurona y VUELVE, lenta
+    for (const b of branches) for (let k = 0; k < per; k++) sparks.push({ curve: b.curve, t: Math.random(), v: 0.0022 + Math.random() * 0.0028, dir: Math.random() < 0.5 ? 1 : -1 });
     sparkGeo = new T.BufferGeometry();
     sparkGeo.setAttribute('position', new T.BufferAttribute(new Float32Array(Math.max(sparks.length, 1) * 3), 3));
     sparkPts = new T.Points(sparkGeo, sparkMat);
@@ -775,7 +827,7 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
       const behind = v.z > 1;
       const x = (v.x * 0.5 + 0.5) * innerWidth, y = (-v.y * 0.5 + 0.5) * innerHeight;
       el.style.left = `${x}px`; el.style.top = `${y}px`;
-      el.style.opacity = behind ? 0 : Math.max(0.25, 1.15 - v.z * 0.9).toFixed(2);
+      el.style.opacity = behind ? 0 : 1; // cards siempre sólidas
       el.style.pointerEvents = behind ? 'none' : 'auto';
       el.style.zIndex = behind ? 1 : Math.round((1 - v.z) * 100) + 2;
     }
@@ -796,12 +848,14 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
       }
     }
     placeCamera();
+    coreGroup.rotation.y = t * 0.55; // el mini cerebro gira solo, continuo
     // chispas
     if (sparks.length) {
       const arr = sparkGeo.attributes.position.array;
       sparks.forEach((s, i) => {
-        s.t += s.v * (1 + pulseEnergy * 2.5);
-        if (s.t > 1) s.t = 0;
+        s.t += s.v * s.dir * (1 + pulseEnergy * 3);
+        if (s.t >= 1) { s.t = 1; s.dir = -1; }
+        if (s.t <= 0) { s.t = 0; s.dir = 1; }
         const p = s.curve.getPoint(s.t);
         arr[i * 3] = p.x; arr[i * 3 + 1] = p.y; arr[i * 3 + 2] = p.z;
       });
