@@ -370,9 +370,22 @@ function broadcast(msg) {
 }
 
 /* ---------- P2P (trackers WebTorrent, solo señalización) ---------- */
-// solo trackers vivos verificados — los muertos ensucian el console y frenan
-const TRACKERS = ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev'];
-const RTC = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }] };
+// varios trackers: basta que AMBOS dispositivos coincidan en uno para encontrarse
+const TRACKERS = [
+  'wss://tracker.openwebtorrent.com',
+  'wss://tracker.webtorrent.dev',
+  'wss://tracker.novage.com.ua',
+];
+// STUN para descubrir IP pública + TURN gratuito como último recurso en NATs
+// duros (el relay solo ve bytes ya cifrados E2E — no puede leer nada)
+const RTC = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  ],
+};
 const randBin = (n) => String.fromCharCode(...crypto.getRandomValues(new Uint8Array(n)).map((b) => b % 128));
 const selfId = randBin(20);
 let infoHash = '', pending = new Map(), sockets = [];
@@ -437,7 +450,7 @@ async function onTracker(ws, msg) {
 }
 const ice = (pc) => new Promise((res) => {
   if (pc.iceGatheringState === 'complete') return res();
-  const t = setTimeout(res, 2500);
+  const t = setTimeout(res, 5000); // iOS junta candidatos lento — darle margen
   pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } };
 });
 // Los mensajes de cadena se procesan EN SERIE: evita la carrera donde dos
@@ -471,7 +484,10 @@ function wire(pc, dc) {
 
 /* ---------- UI: estado y cards ---------- */
 function updateNet() {
-  $('net').textContent = peers.size ? 'sincronizado p2p · cifrado' : sockets.length ? 'buscando peers…' : 'offline · réplica local';
+  // nº de trackers visible: diagnóstico clave — si marca 0, la red bloquea la señalización
+  $('net').textContent = peers.size
+    ? 'sincronizado p2p · cifrado'
+    : sockets.length ? `buscando peers… (${sockets.length} trackers)` : 'offline · réplica local';
 }
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); }
