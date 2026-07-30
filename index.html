@@ -301,9 +301,12 @@
       <div id="e-img"></div>
       <p id="paste-hint">⌘V / Ctrl+V pega texto, imágenes o archivos. También puedes arrastrarlos aquí. Para código usa ```lenguaje … ``` — todo se cifra antes de salir del dispositivo.</p>
       <input type="file" id="e-file" multiple hidden />
+      <!-- accept de galería: en iOS/Android abre fotos y vídeos con selección múltiple -->
+      <input type="file" id="e-media" multiple accept="image/*,video/*" hidden />
       <div class="row">
         <button id="e-save">guardar</button>
-        <button id="e-attach" class="ghost">adjuntar archivo</button>
+        <button id="e-media-btn" class="ghost">fotos / vídeos</button>
+        <button id="e-attach" class="ghost">archivo</button>
         <button id="e-cancel" class="ghost">cancelar</button>
       </div>
     </div>
@@ -420,8 +423,14 @@ const Security = {
 
 /* ---------- bloque v2 (contenido cifrado dentro de payload.enc) ---------- */
 const GENESIS_PREV = '0'.repeat(64);
-const serialize = (i, prev, ts, type, p) =>
-  JSON.stringify([i, prev, ts, type, p.noteId ?? null, p.enc ?? null, p.ownerPubKey ?? null]);
+// Los campos extra SOLO se añaden en los tipos nuevos (DEVICE_*): si se
+// agregaran al array base, los bloques ya existentes cambiarían de hash y
+// toda la cadena guardada quedaría inválida.
+const serialize = (i, prev, ts, type, p) => {
+  const base = [i, prev, ts, type, p.noteId ?? null, p.enc ?? null, p.ownerPubKey ?? null];
+  if (type === 'DEVICE_ADD' || type === 'DEVICE_REVOKE') base.push(p.pubKey ?? null);
+  return JSON.stringify(base);
+};
 const hashBlock = (b) => sha256Hex(serialize(b.index, b.prevHash, b.timestamp, b.type, b.payload));
 
 const keyCache = new Map();
@@ -430,7 +439,10 @@ async function ownerVerifyKey(pubHex) {
     keyCache.set(pubHex, await crypto.subtle.importKey('raw', hexBytes(pubHex), { name: 'Ed25519' }, false, ['verify']));
   return keyCache.get(pubHex);
 }
-async function verifyBlock(b, prev, owner) {
+const blockSigner = (b, owner) => b.signerPubKey ?? owner; // bloques antiguos: los firmaba el owner
+
+// `writers` = claves autorizadas a escribir en el momento de este bloque.
+async function verifyBlock(b, prev, owner, writers) {
   if ((await hashBlock(b)) !== b.hash) return 'hash inválido';
   if (prev === null) {
     if (b.index !== 0 || b.prevHash !== GENESIS_PREV || b.type !== 'GENESIS') return 'génesis malformado';
@@ -440,17 +452,40 @@ async function verifyBlock(b, prev, owner) {
     if (b.prevHash !== prev.hash) return 'prevHash no enlaza';
     if (b.type === 'GENESIS') return 'GENESIS fuera de 0';
   }
-  const ok = await crypto.subtle.verify('Ed25519', await ownerVerifyKey(owner), hexBytes(b.signature), enc(b.hash));
+  const signer = blockSigner(b, owner);
+  if (writers && !writers.has(signer)) return 'firmante no autorizado';
+  // matar el cerebro y repartir permisos: privilegio exclusivo del owner
+  if ((b.type === 'DESTROY' || b.type === 'DEVICE_ADD' || b.type === 'DEVICE_REVOKE') && signer !== owner)
+    return `${b.type} solo lo puede firmar el owner`;
+  const ok = await crypto.subtle.verify('Ed25519', await ownerVerifyKey(signer), hexBytes(b.signature), enc(b.hash));
   return ok ? null : 'firma inválida';
 }
+
+// conjunto de escritores tras aplicar la cadena entera
+function writersOf(chain) {
+  const owner = chain[0]?.payload.ownerPubKey;
+  const set = new Set(owner ? [owner] : []);
+  for (const b of chain) {
+    if (blockSigner(b, owner) !== owner) continue; // solo el owner reparte permisos
+    if (b.type === 'DEVICE_ADD' && b.payload.pubKey) set.add(b.payload.pubKey);
+    if (b.type === 'DEVICE_REVOKE' && b.payload.pubKey) set.delete(b.payload.pubKey);
+  }
+  return set;
+}
+
 async function verifyChain(blocks, expectedId) {
   if (!blocks.length) return 'vacía';
   const owner = blocks[0].payload.ownerPubKey;
   if (!owner) return 'sin owner';
   if (expectedId && blocks[0].hash !== expectedId) return 'génesis ajeno';
+  const writers = new Set([owner]);
   for (let i = 0; i < blocks.length; i++) {
-    const err = await verifyBlock(blocks[i], i ? blocks[i - 1] : null, owner);
+    const b = blocks[i];
+    const err = await verifyBlock(b, i ? blocks[i - 1] : null, owner, writers);
     if (err) return `bloque ${i}: ${err}`;
+    // el permiso vale para los bloques SIGUIENTES
+    if (b.type === 'DEVICE_ADD' && b.payload.pubKey) writers.add(b.payload.pubKey);
+    if (b.type === 'DEVICE_REVOKE' && b.payload.pubKey) writers.delete(b.payload.pubKey);
   }
   return null;
 }
@@ -520,7 +555,7 @@ const dbWrite = async (fn) => {
    (que se rompe con mensajes grandes) nunca se atraganta.
    Cada blob se guarda CIFRADO y se verifica por el hash de su contenido claro.
    ============================================================ */
-const MAX_FILE = 25 * 1024 * 1024; // 25 MB por archivo
+const MAX_FILE = 60 * 1024 * 1024; // 60 MB por archivo (vídeos cortos incluidos)
 const CHUNK = 48 * 1024; // bytes de ciphertext por mensaje
 const memBlobs = new Map(); // sesión efímera (invitado): blobs solo en memoria
 
@@ -611,6 +646,8 @@ async function rebuildNotes() {
 async function appendOp(type, payload) {
   const tip = blocks[blocks.length - 1] ?? null;
   const partial = { index: tip ? tip.index + 1 : 0, prevHash: tip ? tip.hash : GENESIS_PREV, timestamp: Date.now(), type, payload };
+  // los bloques de un dispositivo autorizado llevan su propia clave pública
+  if (meta.role !== 'owner') partial.signerPubKey = meta.publicKeyHex;
   const hash = await hashBlock(partial);
   const signature = bytesHex(await crypto.subtle.sign('Ed25519', meta.privateKey, enc(hash)));
   const block = { ...partial, hash, signature };
@@ -621,22 +658,38 @@ async function appendOp(type, payload) {
   return block;
 }
 async function adoptChain(cand) {
-  if (!Array.isArray(cand) || cand.length <= blocks.length) return;
+  if (!Array.isArray(cand) || !cand.length) return;
+  const mine = blocks[blocks.length - 1], theirs = cand[cand.length - 1];
+  // Con varios dispositivos escribiendo pueden aparecer ramas de igual altura.
+  // Desempate determinista por hash para que TODOS converjan a la misma;
+  // si no, dos dispositivos se quedarían divergentes para siempre.
+  const better = cand.length > blocks.length || (cand.length === blocks.length && mine && theirs.hash < mine.hash);
+  if (!better) return;
   const err = await verifyChain(cand, meta.chainId);
   if (err) return log(`cadena rechazada: ${err}`);
+  // mis operaciones que la otra rama no tiene: se reaplican después (rebase),
+  // así una edición simultánea no se pierde en silencio
+  const theirHashes = new Set(cand.map((b) => b.hash));
+  const orphans = canWrite()
+    ? blocks.filter((b) => !theirHashes.has(b.hash) && b.type.startsWith('NOTE_') && blockSigner(b, blocks[0]?.payload.ownerPubKey) === (meta.publicKeyHex ?? blocks[0]?.payload.ownerPubKey))
+    : [];
   blocks = cand;
   await dbWrite((tx) => { tx.objectStore('blocks').clear(); for (const b of cand) tx.objectStore('blocks').put(b); });
   log(`cadena verificada · ${cand.length} bloques`);
   // la cadena trae la sentencia de muerte (llegamos tarde a la fiesta)
   if (cand.some((b) => b.type === 'DESTROY')) return brainDeath();
   await refresh(true);
+  for (const o of orphans) { // reaplicar mis cambios sobre la rama adoptada
+    try { await appendOp(o.type, o.payload); } catch {}
+  }
+  if (orphans.length) log(`${orphans.length} cambio(s) propio(s) reaplicado(s) tras sincronizar`);
 }
 async function receiveBlock(block, from) {
   const tip = blocks[blocks.length - 1] ?? null;
   const owner = blocks[0]?.payload.ownerPubKey;
   if (blocks[block.index]?.hash === block.hash) return; // ya lo tenemos (eco de gossip)
   if (!owner || !tip || block.index !== tip.index + 1) return from?.send(JSON.stringify({ t: 'GET_BLOCKS' }));
-  const err = await verifyBlock(block, tip, owner);
+  const err = await verifyBlock(block, tip, owner, writersOf(blocks));
   if (err) return log(`bloque rechazado: ${err}`);
   blocks.push(block);
   await dbWrite((tx) => tx.objectStore('blocks').put(block));
@@ -713,6 +766,46 @@ const saveTomb = () => dbWrite((tx) => {
 function broadcast(msg) {
   const d = JSON.stringify(msg);
   for (const p of peers.values()) if (p.dc?.readyState === 'open') p.dc.send(d);
+}
+
+/* ============================================================
+   AUTORIZACIÓN DE DISPOSITIVOS PROPIOS
+   Un dispositivo que entró con "enlace de mi dispositivo" pide permiso de
+   escritura. El owner exige una prueba de que realmente tiene la llave de
+   cifrado (el tracker conoce el topic en claro, así que estar en el enjambre
+   no prueba nada) y solo entonces firma un DEVICE_ADD con su pubkey.
+   ============================================================ */
+const pendingAuth = new Map(); // pubKey → nonce esperado (lado owner)
+const canWrite = () => Boolean(meta) && (meta.role === 'owner' || (meta.publicKeyHex && writersOf(blocks).has(meta.publicKeyHex)));
+const wantsWrite = () => Boolean(meta?.device) && !canWrite();
+
+function askForWriteAccess(dc) {
+  if (!wantsWrite() || !blocks.length) return;
+  try { dc.send(JSON.stringify({ t: 'AUTH_REQ', pub: meta.publicKeyHex })); } catch {}
+}
+
+async function onAuthReq(dc, pub) {
+  if (meta.role !== 'owner' || !/^[0-9a-f]{64}$/.test(pub ?? '')) return;
+  if (writersOf(blocks).has(pub)) return; // ya autorizado
+  const nonce = bytesHex(crypto.getRandomValues(new Uint8Array(16)));
+  pendingAuth.set(pub, nonce);
+  dc.send(JSON.stringify({ t: 'AUTH_CHALLENGE', pub, box: await Security.encrypt({ nonce }) }));
+}
+
+async function onAuthChallenge(dc, m) {
+  if (m.pub !== meta.publicKeyHex) return;
+  const data = await Security.decrypt(m.box); // solo descifra quien tiene la llave
+  if (!data?.nonce) return;
+  dc.send(JSON.stringify({ t: 'AUTH_PROOF', pub: meta.publicKeyHex, nonce: data.nonce }));
+}
+
+async function onAuthProof(m) {
+  if (meta.role !== 'owner') return;
+  if (pendingAuth.get(m.pub) !== m.nonce) return log('dispositivo rechazado: prueba inválida');
+  pendingAuth.delete(m.pub);
+  if (writersOf(blocks).has(m.pub)) return;
+  await appendOp('DEVICE_ADD', { pubKey: m.pub });
+  log(`dispositivo ${m.pub.slice(0, 4)} autorizado a escribir`);
 }
 
 /* ---------- transferencia de blobs por trozos ---------- */
@@ -952,6 +1045,7 @@ function wire(pc, dc) {
       log('sinapsis establecida — P2P directo cifrado');
       refresh();
       if (m.height > blocks.length) dc.send(JSON.stringify({ t: 'GET_BLOCKS' }));
+      askForWriteAccess(dc); // si soy un dispositivo propio aún sin permiso
     } else if (m.t === 'DESTROYED') {
       // sentencia recibida: solo se acata si la firma es del owner de MI génesis
       const owner = blocks[0]?.payload.ownerPubKey;
@@ -965,6 +1059,9 @@ function wire(pc, dc) {
     }
     else if (m.t === 'BLOCKS') { if (!tombstone) enqueue(() => adoptChain(m.blocks)); }
     else if (m.t === 'NEW_BLOCK') { if (!tombstone) enqueue(() => receiveBlock(m.block, dc)); }
+    else if (m.t === 'AUTH_REQ') enqueue(() => onAuthReq(dc, m.pub));
+    else if (m.t === 'AUTH_CHALLENGE') enqueue(() => onAuthChallenge(dc, m));
+    else if (m.t === 'AUTH_PROOF') enqueue(() => onAuthProof(m));
     else if (m.t === 'GET_BLOB') { if (!tombstone) sendBlob(dc, m.hash); }
     else if (m.t === 'BLOB_START') incoming.set(m.hash, { iv: m.iv, chunks: new Array(m.chunks), total: m.chunks, got: 0 });
     else if (m.t === 'BLOB_CHUNK') enqueue(() => onBlobChunk(m));
@@ -977,8 +1074,10 @@ function wire(pc, dc) {
 setInterval(() => {
   for (const [id, p] of peers) {
     if (p.dc.readyState !== 'open') { peers.delete(id); dropChip(id); refresh(); continue; }
-    try { p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex })); }
-    catch { peers.delete(id); dropChip(id); refresh(); }
+    try {
+      p.dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length, id: selfHex }));
+      askForWriteAccess(p.dc); // reintentar: el owner pudo no estar online al conectar
+    } catch { peers.delete(id); dropChip(id); refresh(); }
   }
 }, 10_000);
 
@@ -996,12 +1095,13 @@ const renderAll = () => { syncCards(); if (!$('modal').hidden && viewingId) open
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); requestMissingBlobs(); }
   syncBlobAvailability(); // también al arrancar: los blobs están en disco pero no en memoria
+  const write = canWrite();
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
-  $('role').textContent = meta.role === 'owner' ? 'owner' : 'lector';
-  $('add').hidden = $('paste').hidden = meta.role !== 'owner';
+  $('role').textContent = meta.role === 'owner' ? 'owner' : meta.device ? (write ? 'mi dispositivo' : 'esperando permiso') : 'invitado';
+  $('add').hidden = $('paste').hidden = !write;
   $('find').hidden = false;
-  $('share').hidden = false;
+  $('share').hidden = meta.role !== 'owner'; // solo el owner reparte enlaces
   $('netoggle').hidden = false;
   $('forget').hidden = false;
   $('forget').textContent = meta.role === 'owner' ? 'eliminar cerebro' : 'salir';
@@ -1140,13 +1240,15 @@ async function openView(id) {
     const url = await blobUrl(f);
     if (!url) { const p = pendingBox(); p.textContent = `⏳ ${f.name} — recibiendo…`; box.append(p); continue; }
     if (isImage(f)) { const img = document.createElement('img'); img.src = url; box.append(img); }
+    else if ((f.type || '').startsWith('video/')) { const v = document.createElement('video'); v.src = url; v.controls = true; v.style.maxWidth = '100%'; box.append(v); }
+    else if ((f.type || '').startsWith('audio/')) { const a2 = document.createElement('audio'); a2.src = url; a2.controls = true; a2.style.width = '100%'; box.append(a2); }
     const a = document.createElement('a');
     a.className = 'fchip dl';
     a.href = url; a.download = f.name;
     a.textContent = `↓ ${f.name} · ${prettySize(f.size)}`;
     box.append(a);
   }
-  $('v-edit').hidden = $('v-del').hidden = meta.role !== 'owner';
+  $('v-edit').hidden = $('v-del').hidden = !canWrite();
   $('v-edit').onclick = () => openEdit(id);
   $('v-del').onclick = async () => { $('modal').hidden = true; viewingId = null; await appendOp('NOTE_DELETE', { noteId: id }); };
 }
@@ -1188,15 +1290,23 @@ async function renderPendingImg() {
 }
 
 async function attachFiles(fileList) {
-  for (const file of fileList) {
+  const files = [...fileList];
+  let i = 0;
+  for (const file of files) {
+    i++;
+    if (files.length > 1) log(`cifrando ${i}/${files.length}: ${file.name}`);
     const desc = await ingestFile(file);
     if (desc && !pendingFiles.some((f) => f.hash === desc.hash)) pendingFiles.push(desc);
+    renderPendingImg(); // ir mostrando lo ya cifrado
   }
-  renderPendingImg();
+  if (files.length > 1) log(`${files.length} archivos listos`);
 }
 
 $('e-attach').onclick = () => $('e-file').click();
-$('e-file').onchange = (e) => { attachFiles(e.target.files); e.target.value = ''; };
+$('e-media-btn').onclick = () => $('e-media').click();
+const onPick = (e) => { attachFiles(e.target.files); e.target.value = ''; };
+$('e-file').onchange = onPick;
+$('e-media').onchange = onPick;
 $('v-close').onclick = () => { $('modal').hidden = true; viewingId = null; };
 $('e-cancel').onclick = () => { $('modal').hidden = true; viewingId = null; };
 $('add').onclick = () => openEdit(null);
@@ -1219,10 +1329,10 @@ $('e-content').addEventListener('paste', async (e) => {
 });
 
 // arrastrar y soltar archivos en cualquier parte (owner)
-addEventListener('dragover', (e) => { if (meta?.role === 'owner') { e.preventDefault(); document.body.classList.add('dropping'); } });
+addEventListener('dragover', (e) => { if (canWrite()) { e.preventDefault(); document.body.classList.add('dropping'); } });
 addEventListener('dragleave', () => document.body.classList.remove('dropping'));
 addEventListener('drop', async (e) => {
-  if (meta?.role !== 'owner' || !e.dataTransfer?.files.length) return;
+  if (!canWrite() || !e.dataTransfer?.files.length) return;
   e.preventDefault();
   document.body.classList.remove('dropping');
   if ($('m-edit').hidden) { openEdit(null); } // sin editor abierto: nota nueva con los archivos
@@ -1241,7 +1351,7 @@ async function createNote(data) {
 
 let lastPaste = { sig: '', ts: 0 };
 window.addEventListener('paste', async (e) => {
-  if (!meta || meta.role !== 'owner') return;
+  if (!canWrite()) return;
   if (!$('modal').hidden || !$('spot').hidden || !$('setup').hidden) return; // dentro de un editor: pegado nativo
   // anti-duplicado: mismo contenido en <3s = un solo ⌘V (algunos navegadores disparan doble)
   const sig = e.clipboardData?.getData('text') || 'img';
@@ -1262,6 +1372,7 @@ window.addEventListener('paste', async (e) => {
 
 // botón pegar (móvil no tiene ⌘V global): lee el portapapeles con permiso del usuario
 $('paste').onclick = async () => {
+  if (!canWrite()) return;
   try {
     if (navigator.clipboard.read) {
       try {
@@ -1430,10 +1541,18 @@ $('btn-join').onclick = async () => {
   const raw = $('join-code').value.trim();
   const m = raw.match(/([0-9a-f]{64})\.([0-9a-f]{64})(\.d)?/i);
   if (!m) return log('código inválido — pide al owner su "enlace secreto"');
-  PERSIST = Boolean(m[3]); // solo el owner concede recordar, vía sufijo .d del enlace
-  meta = { role: 'reader', chainId: m[1].toLowerCase(), encKey: m[2].toLowerCase() };
+  const own = Boolean(m[3]); // sufijo .d: el owner marcó este enlace como "mi dispositivo"
+  PERSIST = own;
+  meta = { role: 'reader', chainId: m[1].toLowerCase(), encKey: m[2].toLowerCase(), device: own };
+  if (own) {
+    // identidad propia del dispositivo: con ella firmará sus notas cuando el
+    // owner lo autorice (la privada nunca sale de aquí)
+    const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
+    meta.publicKeyHex = bytesHex(await crypto.subtle.exportKey('raw', kp.publicKey));
+    meta.privateKey = kp.privateKey;
+  }
   await dbWrite((tx) => tx.objectStore('meta').put(meta, 'meta'));
-  log(PERSIST ? 'dispositivo autorizado — buscando el cerebro…' : 'sesión efímera (invitado) — al cerrar la pestaña se olvida todo');
+  log(own ? 'mi dispositivo — pidiendo permiso de escritura al owner…' : 'sesión efímera (invitado) — al cerrar la pestaña se olvida todo');
   enterMain();
 };
 (async () => {
