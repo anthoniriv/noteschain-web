@@ -121,6 +121,27 @@
   .row { display: flex; gap: .5rem; flex-wrap: wrap; }
   #paste-hint { font-size: .6rem; color: var(--dim); margin-bottom: .6rem; }
 
+  /* ---- diálogo propio (sustituye a confirm() nativo) ---- */
+  #ask {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.7); backdrop-filter: blur(8px);
+    padding: 1rem;
+  }
+  #ask .sheet {
+    width: min(420px, 94vw);
+    background: var(--bg); border: 1px solid var(--ink);
+    box-shadow: 8px 8px 0 var(--ink);
+    padding: 1.3rem;
+    animation: pop .18s cubic-bezier(.2,1.4,.4,1);
+  }
+  #ask h3 { font-size: .78rem; letter-spacing: .18em; text-transform: uppercase; margin-bottom: .7rem; }
+  #ask p { font-size: .72rem; color: var(--dim); line-height: 1.7; margin-bottom: 1.1rem; white-space: pre-line; }
+  #ask .row { flex-direction: column; }
+  #ask button { width: 100%; text-align: center; padding: .6rem; }
+  #ask button.danger { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  #ask button.danger:hover { background: var(--bg); color: var(--ink); }
+
   /* ---- spotlight ---- */
   #spot {
     position: fixed; inset: 0; z-index: 30;
@@ -253,6 +274,14 @@
   </div>
 </div>
 
+<div id="ask" hidden>
+  <div class="sheet">
+    <h3 id="ask-title"></h3>
+    <p id="ask-msg"></p>
+    <div class="row" id="ask-actions"></div>
+  </div>
+</div>
+
 <div id="spot" hidden>
   <div class="bar"><input id="spot-q" placeholder="buscar en el cerebro…" spellcheck="false" /></div>
   <ul id="spot-res"></ul>
@@ -279,6 +308,32 @@
    ============================================================ */
 const $ = (id) => document.getElementById(id);
 const log = (m) => { $('log').textContent = m; console.log('[noteschain]', m); };
+
+// Diálogo propio en la línea gráfica (nada de confirm() del navegador).
+// Devuelve el `value` de la opción elegida, o null si se cancela.
+function ask({ title, msg, options }) {
+  return new Promise((resolve) => {
+    $('ask-title').textContent = title;
+    $('ask-msg').textContent = msg ?? '';
+    const row = $('ask-actions');
+    row.innerHTML = '';
+    const close = (v) => { $('ask').hidden = true; $('ask').onclick = null; resolve(v); };
+    for (const o of options) {
+      const b = document.createElement('button');
+      b.textContent = o.label;
+      if (!o.primary) b.className = o.danger ? 'danger' : 'ghost';
+      b.onclick = () => close(o.value);
+      row.append(b);
+    }
+    const cancel = document.createElement('button');
+    cancel.textContent = 'cancelar';
+    cancel.className = 'ghost';
+    cancel.onclick = () => close(null);
+    row.append(cancel);
+    $('ask').hidden = false;
+    $('ask').onclick = (e) => { if (e.target === $('ask')) close(null); };
+  });
+}
 
 /* ---------- utilidades ---------- */
 const enc = (s) => new TextEncoder().encode(s);
@@ -501,7 +556,8 @@ $('dead-ok').onclick = () => location.reload();
 let tombstone = null; // { block, chainId, encKey }
 let tombKilled = 0;
 
-async function enterTombstone(destroyBlock) {
+async function enterTombstone(destroyBlock, notifiedNow = 0) {
+  tombKilled = notifiedNow; // los que estaban conectados ya recibieron el broadcast
   tombstone = { block: destroyBlock, chainId: meta.chainId, encKey: meta.encKey };
   blocks = [];
   notes = [];
@@ -509,11 +565,7 @@ async function enterTombstone(destroyBlock) {
   // atómico: las notas y la identidad se van, la sentencia queda.
   // (borrar la base y reescribir se pisaba entre sí y perdía la lápida)
   PERSIST = true;
-  await dbWrite((tx) => {
-    tx.objectStore('blocks').clear();
-    tx.objectStore('meta').delete('meta');
-    tx.objectStore('meta').put({ ...tombstone, tomb: true }, 'tombstone');
-  });
+  await saveTomb();
   await new Promise((r) => setTimeout(r, 1400));
   $('dead-title').textContent = 'cerebro eliminado';
   $('dead-msg').textContent = 'Las notas se borraron. Mantén esta pestaña abierta para que los dispositivos que estén apagados reciban la orden de muerte al reconectar.';
@@ -528,6 +580,12 @@ async function enterTombstone(destroyBlock) {
   $('dead').hidden = false;
 }
 const paintTomb = () => { $('tomb-count').textContent = `dispositivos notificados: ${tombKilled}`; };
+// el contador sobrevive recargas (antes volvía a 0 al reabrir la lápida)
+const saveTomb = () => dbWrite((tx) => {
+  tx.objectStore('blocks').clear();
+  tx.objectStore('meta').delete('meta');
+  tx.objectStore('meta').put({ ...tombstone, tomb: true, killed: tombKilled }, 'tombstone');
+});
 function broadcast(msg) {
   const d = JSON.stringify(msg);
   for (const p of peers.values()) if (p.dc?.readyState === 'open') p.dc.send(d);
@@ -703,9 +761,13 @@ function wire(pc, dc) {
       peers.set(key, { pc, dc });
       // modo lápida: al primer contacto, entregar la sentencia y contar la baja
       if (tombstone) {
-        try { dc.send(JSON.stringify({ t: 'DESTROYED', block: tombstone.block })); console.log('[noteschain] sentencia enviada a', id.slice(0, 4)); } catch {}
-        tombKilled++;
-        paintTomb();
+        try {
+          dc.send(JSON.stringify({ t: 'DESTROYED', block: tombstone.block }));
+          console.log('[noteschain] sentencia enviada a', id.slice(0, 4));
+          tombKilled++;
+          paintTomb();
+          saveTomb();
+        } catch {}
         return;
       }
       dropPairingChips();
@@ -973,8 +1035,17 @@ $('spot').onclick = (e) => { if (e.target === $('spot')) closeSpot(); };
 /* ---------- compartir ---------- */
 // El owner decide el poder del enlace: sufijo ".d" = dispositivo propio
 // (autorizado a recordar). Sin sufijo = invitado, siempre efímero.
-$('share').onclick = () => {
-  const mine = confirm('¿Este enlace es para un dispositivo TUYO?\n\nAceptar = mi dispositivo (podrá recordar las notas)\nCancelar = invitado (sesión efímera, olvida todo al cerrar)');
+$('share').onclick = async () => {
+  const kind = await ask({
+    title: 'compartir cerebro',
+    msg: '¿Para quién es este enlace? Solo tú decides qué dispositivos pueden guardar una copia de las notas.',
+    options: [
+      { label: 'mi dispositivo (puede recordar)', value: 'mine', primary: true },
+      { label: 'invitado (sesión efímera)', value: 'guest' },
+    ],
+  });
+  if (!kind) return;
+  const mine = kind === 'mine';
   const code = `${meta.chainId}.${meta.encKey}${mine ? '.d' : ''}`;
   const link = location.protocol.startsWith('http') ? `${location.origin}${location.pathname}#${code}` : code;
   navigator.clipboard.writeText(link);
@@ -1000,15 +1071,26 @@ $('netoggle').onclick = () => {
 // cada dispositivo es dueño de su copia.
 $('forget').onclick = async () => {
   if (meta?.role === 'owner') {
-    if (!confirm('¿ELIMINAR este cerebro?\n\nSe emite una sentencia de muerte firmada: TODOS los dispositivos se desconectan y borran su réplica (los apagados, al reconectar). Las notas se pierden PARA SIEMPRE. ¿Continuar?')) return;
+    const ok = await ask({
+      title: 'eliminar cerebro',
+      msg: 'Se emite una sentencia de muerte firmada: todos los dispositivos se desconectan y borran su réplica (los apagados, al reconectar).\n\nLas notas se pierden para siempre.',
+      options: [{ label: 'eliminar para siempre', value: true, danger: true }],
+    });
+    if (!ok) return;
     // bloque DESTROY firmado + broadcast, y quedarse como lápida difundiéndolo
     let destroyBlock = null;
+    const conectados = peers.size; // estos reciben la sentencia en el broadcast
     try { destroyBlock = await appendOp('DESTROY', {}); } catch {}
     await new Promise((r) => setTimeout(r, 600)); // dar tiempo al broadcast inmediato
-    if (destroyBlock) return enterTombstone(destroyBlock);
+    if (destroyBlock) return enterTombstone(destroyBlock, conectados);
     return brainDeath();
   }
-  if (!confirm('¿Olvidar este cerebro en este dispositivo? Se borra la réplica y la llave. Necesitarás el enlace secreto para volver.')) return;
+  const salir = await ask({
+    title: 'salir del cerebro',
+    msg: 'Se borra la réplica y la llave de este dispositivo. Necesitarás el enlace secreto del owner para volver.',
+    options: [{ label: 'salir y borrar aquí', value: true, danger: true }],
+  });
+  if (!salir) return;
   stopP2P();
   await wipeIdb();
   location.reload();
@@ -1066,6 +1148,7 @@ $('btn-join').onclick = async () => {
   const tomb = await dbGet('meta', 'tombstone');
   if (tomb?.tomb) {
     tombstone = { block: tomb.block, chainId: tomb.chainId, encKey: tomb.encKey };
+    tombKilled = tomb.killed ?? 0;
     meta = { role: 'owner', chainId: tomb.chainId, encKey: tomb.encKey };
     $('setup').hidden = true;
     $('dead-title').textContent = 'cerebro eliminado';
