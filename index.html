@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NotesChain</title>
+<style>
+  /* Tema: main BLANCO, tinta negra. */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #ffffff; --ink: #000000;
+    --dim: rgba(0,0,0,.45); --line: rgba(0,0,0,.16);
+  }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    overflow: hidden;
+  }
+  #brain { position: fixed; inset: 0; z-index: 0; display: block; cursor: grab; width: 100vw; height: 100vh; }
+  #brain.dragging { cursor: grabbing; }
+
+  /* ---- barra superior mínima ---- */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 5;
+    display: flex; align-items: center; gap: 1.2rem;
+    padding: .9rem 1.2rem;
+    font-size: .65rem; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--dim);
+    pointer-events: none;
+  }
+  #topbar b { color: var(--ink); font-weight: 400; }
+  #topbar .title { font-weight: 700; color: var(--ink); letter-spacing: .3em; margin-right: .5rem; }
+  #topbar button { pointer-events: auto; }
+
+  button {
+    background: var(--ink); color: var(--bg);
+    border: 1px solid var(--ink);
+    font: inherit; font-size: .62rem; letter-spacing: .1em; text-transform: uppercase;
+    padding: .4rem .8rem; cursor: pointer;
+  }
+  button:hover { background: var(--bg); color: var(--ink); }
+  button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  button.ghost:hover { border-color: var(--ink); }
+
+  input, textarea {
+    width: 100%;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line);
+    font: inherit; font-size: .8rem;
+    padding: .6rem .7rem; margin-bottom: .6rem;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--ink); }
+  ::placeholder { color: var(--dim); }
+
+  /* ---- setup ---- */
+  #setup {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
+    background: rgba(255,255,255,.82); backdrop-filter: blur(6px);
+    padding: 1rem;
+  }
+  #setup .card {
+    width: min(460px, 92vw);
+    border: 1px solid var(--line); background: var(--bg);
+    padding: 1.4rem; margin-bottom: 1rem;
+  }
+  #setup h2 { font-size: .78rem; letter-spacing: .18em; text-transform: uppercase; margin-bottom: .6rem; }
+  #setup p { font-size: .72rem; color: var(--dim); line-height: 1.6; margin-bottom: 1rem; }
+
+  /* ---- cards de nota (proyectadas sobre el cerebro) ---- */
+  .ncard {
+    position: fixed; z-index: 2;
+    width: 150px;
+    transform: translate(-50%, -120%);
+    background: var(--bg);
+    border: 1px solid var(--ink);
+    padding: .5rem .6rem;
+    cursor: pointer;
+    transition: box-shadow .15s;
+    will-change: left, top, opacity;
+  }
+  .ncard:hover { box-shadow: 4px 4px 0 var(--ink); }
+  .ncard h4 { font-size: .62rem; letter-spacing: .06em; text-transform: uppercase; margin-bottom: .25rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ncard p { font-size: .58rem; color: var(--dim); line-height: 1.45; max-height: 2.9em; overflow: hidden; word-break: break-word; }
+  .ncard img { width: 100%; height: 64px; object-fit: cover; display: block; margin-bottom: .3rem; filter: grayscale(1) contrast(1.1); }
+  .ncard.hit { box-shadow: 6px 6px 0 var(--ink); outline: 2px solid var(--ink); }
+
+  /* ---- modal nota ---- */
+  #modal {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.75); backdrop-filter: blur(8px);
+  }
+  #modal .sheet {
+    width: min(600px, 94vw); max-height: 86vh; overflow-y: auto;
+    background: var(--bg); border: 1px solid var(--ink);
+    box-shadow: 8px 8px 0 var(--ink);
+    padding: 1.4rem;
+  }
+  #modal .sheet img { max-width: 100%; display: block; margin: .6rem 0; }
+  #m-view h3 { font-size: 1rem; margin-bottom: .8rem; }
+  #m-view pre { white-space: pre-wrap; word-break: break-word; font: inherit; font-size: .82rem; line-height: 1.7; margin-bottom: 1rem; }
+  #m-view small { display:block; color: var(--dim); font-size: .62rem; margin-bottom: 1rem; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; }
+  #paste-hint { font-size: .6rem; color: var(--dim); margin-bottom: .6rem; }
+
+  /* ---- spotlight ---- */
+  #spot {
+    position: fixed; inset: 0; z-index: 30;
+    display: flex; flex-direction: column; align-items: center;
+    padding-top: 18vh;
+    background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
+  }
+  #spot .bar {
+    width: min(520px, 92vw);
+    background: var(--bg); border: 1px solid var(--ink);
+    box-shadow: 8px 8px 0 var(--ink);
+    padding: .4rem;
+    animation: pop .18s cubic-bezier(.2,1.4,.4,1);
+  }
+  @keyframes pop { from { transform: scale(.92); opacity: 0; } }
+  #spot input { border: none; font-size: 1rem; padding: .7rem .8rem; margin: 0; }
+  #spot ul { list-style: none; width: min(520px, 92vw); margin-top: .6rem; }
+  #spot li {
+    background: var(--bg); border: 1px solid var(--line);
+    padding: .6rem .8rem; margin-bottom: .3rem; cursor: pointer;
+    font-size: .75rem;
+  }
+  #spot li b { font-weight: 700; }
+  #spot li.sel { border-color: var(--ink); box-shadow: 4px 4px 0 var(--ink); }
+  #spot li small { color: var(--dim); font-size: .62rem; display: block; margin-top: .2rem; }
+
+  #add {
+    position: fixed; right: 1.4rem; bottom: 1.4rem; z-index: 5;
+    width: 3rem; height: 3rem; font-size: 1.3rem; padding: 0;
+    border-radius: 50%;
+  }
+  #log {
+    position: fixed; left: 1rem; bottom: 1rem; z-index: 4;
+    font-size: .6rem; color: var(--dim); max-width: 55vw;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="brain"></canvas>
+
+<div id="topbar">
+  <span class="title">NOTESCHAIN</span>
+  <span>rol <b id="role">—</b></span>
+  <span>neuronas <b id="height">0</b></span>
+  <span>sinapsis <b id="peers">0</b></span>
+  <span id="net">—</span>
+  <button id="share" class="ghost" hidden>enlace secreto</button>
+</div>
+
+<div id="setup">
+  <div class="card">
+    <h2>Crear cerebro</h2>
+    <p>Genera el génesis, tu llave de firma (owner) y la llave de cifrado AES-256. Todo el contenido viaja y se guarda cifrado — sin el enlace secreto nadie puede leer ni encontrar tu red.</p>
+    <button id="btn-create">crear</button>
+  </div>
+  <div class="card">
+    <h2>Conectar con enlace secreto</h2>
+    <p>Pega el enlace o código que compartió el owner (contiene la llave de cifrado). Este dispositivo replica, verifica y descifra — solo lectura.</p>
+    <input id="join-code" placeholder="enlace o código secreto" spellcheck="false" />
+    <button id="btn-join" class="ghost">conectar</button>
+  </div>
+</div>
+
+<button id="add" hidden>+</button>
+
+<div id="modal" hidden>
+  <div class="sheet">
+    <div id="m-view" hidden>
+      <h3 id="v-title"></h3>
+      <div id="v-img"></div>
+      <pre id="v-content"></pre>
+      <small id="v-date"></small>
+      <div class="row">
+        <button id="v-edit" hidden>editar</button>
+        <button id="v-del" class="ghost" hidden>borrar</button>
+        <button id="v-close" class="ghost">cerrar</button>
+      </div>
+    </div>
+    <div id="m-edit" hidden>
+      <input id="e-title" placeholder="título" />
+      <textarea id="e-content" placeholder="escribe o pega tu nota… (⌘V / Ctrl+V — también imágenes)" rows="8"></textarea>
+      <div id="e-img"></div>
+      <p id="paste-hint">⌘C/⌘V y Ctrl+C/Ctrl+V funcionan aquí. Pega una imagen y se cifra junto a la nota.</p>
+      <div class="row">
+        <button id="e-save">guardar</button>
+        <button id="e-cancel" class="ghost">cancelar</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="spot" hidden>
+  <div class="bar"><input id="spot-q" placeholder="buscar en el cerebro…" spellcheck="false" /></div>
+  <ul id="spot-res"></ul>
+</div>
+
+<div id="log"></div>
+
+<script type="module">
+/* ============================================================
+   NotesChain v2 — nodo completo cifrado en el navegador.
+   - E2E: AES-256-GCM sobre el contenido; la llave solo viaja en el
+     enlace secreto (#fragment — nunca llega a ningún servidor).
+   - Descubrimiento ciego: el topic P2P se deriva de la llave de
+     cifrado → sin el enlace no puedes ni ENCONTRAR la red.
+   - Integridad: cadena de bloques firmada Ed25519 por el owner.
+   - UI: el cerebro ES la interfaz. Cada nota = neurona en una rama.
+   ============================================================ */
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $('log').textContent = m; console.log('[noteschain]', m); };
+
+/* ---------- utilidades ---------- */
+const enc = (s) => new TextEncoder().encode(s);
+const dec = (b) => new TextDecoder().decode(b);
+const bytesHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const hexBytes = (hex) => Uint8Array.from(hex.match(/../g), (h) => parseInt(h, 16));
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const sha256Hex = async (str) => bytesHex(await crypto.subtle.digest('SHA-256', enc(str)));
+
+/* ============================================================
+   MÓDULO DE SEGURIDAD
+   ============================================================ */
+const Security = {
+  aesKey: null, // CryptoKey AES-GCM importada
+
+  async importKey(keyHex) {
+    this.aesKey = await crypto.subtle.importKey('raw', hexBytes(keyHex), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  },
+  newKeyHex() {
+    return bytesHex(crypto.getRandomValues(new Uint8Array(32)));
+  },
+  // plaintext (objeto) → "b64(iv).b64(cipher)"
+  async encrypt(obj) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.aesKey, enc(JSON.stringify(obj)));
+    return `${b64(iv)}.${b64(ct)}`;
+  },
+  async decrypt(payloadEnc) {
+    try {
+      const [ivB, ctB] = payloadEnc.split('.');
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(ivB) }, this.aesKey, unb64(ctB));
+      return JSON.parse(dec(pt));
+    } catch { return null; } // llave incorrecta o dato corrupto
+  },
+  // topic de descubrimiento derivado de la LLAVE, no del chainId:
+  // sin llave no puedes ni anunciarte en el mismo canal.
+  async topic(keyHex) {
+    return (await sha256Hex('noteschain-v2-topic:' + keyHex)).slice(0, 40);
+  },
+};
+
+/* ---------- bloque v2 (contenido cifrado dentro de payload.enc) ---------- */
+const GENESIS_PREV = '0'.repeat(64);
+const serialize = (i, prev, ts, type, p) =>
+  JSON.stringify([i, prev, ts, type, p.noteId ?? null, p.enc ?? null, p.ownerPubKey ?? null]);
+const hashBlock = (b) => sha256Hex(serialize(b.index, b.prevHash, b.timestamp, b.type, b.payload));
+
+const keyCache = new Map();
+async function ownerVerifyKey(pubHex) {
+  if (!keyCache.has(pubHex))
+    keyCache.set(pubHex, await crypto.subtle.importKey('raw', hexBytes(pubHex), { name: 'Ed25519' }, false, ['verify']));
+  return keyCache.get(pubHex);
+}
+async function verifyBlock(b, prev, owner) {
+  if ((await hashBlock(b)) !== b.hash) return 'hash inválido';
+  if (prev === null) {
+    if (b.index !== 0 || b.prevHash !== GENESIS_PREV || b.type !== 'GENESIS') return 'génesis malformado';
+    if (b.payload.ownerPubKey !== owner) return 'owner no coincide';
+  } else {
+    if (b.index !== prev.index + 1) return 'index no consecutivo';
+    if (b.prevHash !== prev.hash) return 'prevHash no enlaza';
+    if (b.type === 'GENESIS') return 'GENESIS fuera de 0';
+  }
+  const ok = await crypto.subtle.verify('Ed25519', await ownerVerifyKey(owner), hexBytes(b.signature), enc(b.hash));
+  return ok ? null : 'firma inválida';
+}
+async function verifyChain(blocks, expectedId) {
+  if (!blocks.length) return 'vacía';
+  const owner = blocks[0].payload.ownerPubKey;
+  if (!owner) return 'sin owner';
+  if (expectedId && blocks[0].hash !== expectedId) return 'génesis ajeno';
+  for (let i = 0; i < blocks.length; i++) {
+    const err = await verifyBlock(blocks[i], i ? blocks[i - 1] : null, owner);
+    if (err) return `bloque ${i}: ${err}`;
+  }
+  return null;
+}
+
+/* ---------- IndexedDB ---------- */
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('noteschain-v2', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('blocks', { keyPath: 'index' }); r.result.createObjectStore('meta'); };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+const dbGet = async (s, k) => { const d = await idb(); return new Promise((res, rej) => { const r = d.transaction(s).objectStore(s).get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); };
+const dbAll = async () => { const d = await idb(); return new Promise((res, rej) => { const r = d.transaction('blocks').objectStore('blocks').getAll(); r.onsuccess = () => res(r.result.sort((a, b) => a.index - b.index)); r.onerror = () => rej(r.error); }); };
+const dbWrite = async (fn) => { const d = await idb(); return new Promise((res, rej) => { const tx = d.transaction(['blocks', 'meta'], 'readwrite'); fn(tx); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
+
+/* ---------- estado ---------- */
+let blocks = [], meta = null, peers = new Map();
+let notes = []; // [{id,title,content,image,updatedAt}] descifradas
+
+async function rebuildNotes() {
+  const map = new Map();
+  for (const b of blocks) {
+    const { noteId } = b.payload;
+    if (!noteId) continue;
+    if (b.type === 'NOTE_DELETE') { map.delete(noteId); continue; }
+    const data = await Security.decrypt(b.payload.enc);
+    if (!data) continue; // sin llave correcta el contenido es opaco
+    if (b.type === 'NOTE_ADD') map.set(noteId, { id: noteId, ...data, updatedAt: b.timestamp });
+    else if (b.type === 'NOTE_EDIT' && map.has(noteId)) map.set(noteId, { ...map.get(noteId), ...data, updatedAt: b.timestamp });
+  }
+  notes = [...map.values()].sort((a, b) => a.updatedAt - b.updatedAt);
+}
+
+/* ---------- cadena ---------- */
+async function appendOp(type, payload) {
+  const tip = blocks[blocks.length - 1] ?? null;
+  const partial = { index: tip ? tip.index + 1 : 0, prevHash: tip ? tip.hash : GENESIS_PREV, timestamp: Date.now(), type, payload };
+  const hash = await hashBlock(partial);
+  const signature = bytesHex(await crypto.subtle.sign('Ed25519', meta.privateKey, enc(hash)));
+  const block = { ...partial, hash, signature };
+  blocks.push(block);
+  await dbWrite((tx) => tx.objectStore('blocks').put(block));
+  broadcast({ t: 'NEW_BLOCK', block });
+  await refresh(true);
+  return block;
+}
+async function adoptChain(cand) {
+  if (!Array.isArray(cand) || cand.length <= blocks.length) return;
+  const err = await verifyChain(cand, meta.chainId);
+  if (err) return log(`cadena rechazada: ${err}`);
+  blocks = cand;
+  await dbWrite((tx) => { tx.objectStore('blocks').clear(); for (const b of cand) tx.objectStore('blocks').put(b); });
+  log(`cadena verificada · ${cand.length} bloques`);
+  await refresh(true);
+}
+async function receiveBlock(block, from) {
+  const tip = blocks[blocks.length - 1] ?? null;
+  const owner = blocks[0]?.payload.ownerPubKey;
+  if (!owner || !tip || block.index !== tip.index + 1) return from?.send(JSON.stringify({ t: 'GET_BLOCKS' }));
+  const err = await verifyBlock(block, tip, owner);
+  if (err) return log(`bloque rechazado: ${err}`);
+  blocks.push(block);
+  await dbWrite((tx) => tx.objectStore('blocks').put(block));
+  for (const p of peers.values()) if (p.dc !== from && p.dc?.readyState === 'open') p.dc.send(JSON.stringify({ t: 'NEW_BLOCK', block }));
+  await refresh(true);
+}
+function broadcast(msg) {
+  const d = JSON.stringify(msg);
+  for (const p of peers.values()) if (p.dc?.readyState === 'open') p.dc.send(d);
+}
+
+/* ---------- P2P (trackers WebTorrent, solo señalización) ---------- */
+const TRACKERS = ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev', 'wss://tracker.btorrent.xyz', 'wss://tracker.files.fm:7073/announce'];
+const RTC = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }] };
+const randBin = (n) => String.fromCharCode(...crypto.getRandomValues(new Uint8Array(n)).map((b) => b % 128));
+const selfId = randBin(20);
+let infoHash = '', pending = new Map(), sockets = [];
+
+async function startP2P() {
+  infoHash = String.fromCharCode(...hexBytes(await Security.topic(meta.encKey)));
+  TRACKERS.forEach(trackerConnect);
+  setInterval(() => sockets.forEach(announce), 50_000);
+}
+function trackerConnect(url) {
+  let ws; try { ws = new WebSocket(url); } catch { return; }
+  ws.onopen = () => { sockets.push(ws); announce(ws); updateNet(); };
+  ws.onclose = () => { sockets = sockets.filter((s) => s !== ws); updateNet(); setTimeout(() => trackerConnect(url), 30_000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => { try { onTracker(ws, JSON.parse(ev.data)); } catch {} };
+}
+function cleanPending(maxAgeMs = 90_000) {
+  const now = Date.now();
+  for (const [id, p] of pending) {
+    if (now - p.ts > maxAgeMs) { try { p.pc.close(); } catch {} pending.delete(id); }
+  }
+}
+async function announce(ws) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  cleanPending(); // ofertas viejas no consumidas → cerrar (evita fugar PeerConnections)
+  // con sinapsis activas basta mantener pocas ofertas abiertas para dispositivos nuevos
+  const want = peers.size > 0 ? 1 : 3;
+  const offers = [];
+  for (let i = 0; i < want && pending.size < 12; i++) {
+    try {
+      const pc = new RTCPeerConnection(RTC);
+      const dc = pc.createDataChannel('nc');
+      wire(pc, dc);
+      await pc.setLocalDescription(await pc.createOffer());
+      await ice(pc);
+      const id = randBin(20);
+      pending.set(id, { pc, ts: Date.now() });
+      offers.push({ offer_id: id, offer: { type: 'offer', sdp: pc.localDescription.sdp } });
+    } catch { break; } // límite del navegador: parar y reintentar en el próximo announce
+  }
+  if (offers.length)
+    ws.send(JSON.stringify({ action: 'announce', info_hash: infoHash, peer_id: selfId, numwant: offers.length, uploaded: 0, downloaded: 0, left: 0, event: 'started', offers }));
+}
+async function onTracker(ws, msg) {
+  if (msg.info_hash && msg.info_hash !== infoHash) return;
+  if (msg.answer && pending.has(msg.offer_id)) {
+    const { pc } = pending.get(msg.offer_id); pending.delete(msg.offer_id);
+    try { await pc.setRemoteDescription(msg.answer); } catch {}
+  }
+  if (msg.offer && msg.peer_id && msg.peer_id !== selfId && !peers.has(msg.peer_id)) {
+    try {
+      const pc = new RTCPeerConnection(RTC);
+      pc.ondatachannel = (ev) => wire(pc, ev.channel, msg.peer_id);
+      await pc.setRemoteDescription(msg.offer);
+      await pc.setLocalDescription(await pc.createAnswer());
+      await ice(pc);
+      ws.send(JSON.stringify({ action: 'announce', info_hash: infoHash, peer_id: selfId, to_peer_id: msg.peer_id, offer_id: msg.offer_id, answer: { type: 'answer', sdp: pc.localDescription.sdp } }));
+    } catch {}
+  }
+}
+const ice = (pc) => new Promise((res) => {
+  if (pc.iceGatheringState === 'complete') return res();
+  const t = setTimeout(res, 2500);
+  pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } };
+});
+function wire(pc, dc, knownId) {
+  const id = knownId ?? randBin(20);
+  dc.onopen = () => { peers.set(id, { pc, dc }); log('sinapsis establecida — P2P directo cifrado'); dc.send(JSON.stringify({ t: 'HELLO', height: blocks.length })); refresh(); };
+  dc.onclose = () => { peers.delete(id); refresh(); };
+  dc.onmessage = async (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.t === 'HELLO' && m.height > blocks.length) dc.send(JSON.stringify({ t: 'GET_BLOCKS' }));
+    else if (m.t === 'GET_BLOCKS') dc.send(JSON.stringify({ t: 'BLOCKS', blocks }));
+    else if (m.t === 'BLOCKS') await adoptChain(m.blocks);
+    else if (m.t === 'NEW_BLOCK') await receiveBlock(m.block, dc);
+  };
+}
+
+/* ---------- UI: estado y cards ---------- */
+function updateNet() {
+  $('net').textContent = peers.size ? 'sincronizado p2p · cifrado' : sockets.length ? 'buscando peers…' : 'offline · réplica local';
+}
+async function refresh(dataChanged) {
+  if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); }
+  $('height').textContent = blocks.length;
+  $('peers').textContent = peers.size;
+  $('role').textContent = meta.role === 'owner' ? 'owner' : 'lector';
+  $('add').hidden = meta.role !== 'owner';
+  $('share').hidden = false;
+  updateNet();
+}
+
+const SUMMARY_LEN = 90;
+const cardEls = new Map(); // noteId → element
+function syncCards() {
+  const seen = new Set();
+  for (const n of notes) {
+    seen.add(n.id);
+    let el = cardEls.get(n.id);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'ncard';
+      el.onclick = () => openView(n.id);
+      document.body.append(el);
+      cardEls.set(n.id, el);
+      el._sig = null;
+    }
+    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${n.updatedAt}`;
+    if (el._sig !== sig) {
+      el._sig = sig;
+      el.innerHTML = '';
+      if (n.image) { const img = document.createElement('img'); img.src = n.image; el.append(img); }
+      const h = document.createElement('h4'); h.textContent = n.title || '(sin título)'; el.append(h);
+      const txt = n.content ?? '';
+      if (!n.image || txt) {
+        const p = document.createElement('p');
+        p.textContent = txt.length > SUMMARY_LEN ? txt.slice(0, SUMMARY_LEN) + '…' : txt;
+        el.append(p);
+      }
+    }
+  }
+  for (const [id, el] of cardEls) if (!seen.has(id)) { el.remove(); cardEls.delete(id); }
+}
+
+/* ---------- modal ver/editar ---------- */
+let editingId = null;
+let pendingImage = null;
+function openView(id) {
+  const n = notes.find((x) => x.id === id); if (!n) return;
+  $('modal').hidden = false; $('m-view').hidden = false; $('m-edit').hidden = true;
+  $('v-title').textContent = n.title || '(sin título)';
+  $('v-content').textContent = n.content ?? '';
+  $('v-date').textContent = new Date(n.updatedAt).toLocaleString();
+  $('v-img').innerHTML = '';
+  if (n.image) { const img = document.createElement('img'); img.src = n.image; $('v-img').append(img); }
+  $('v-edit').hidden = $('v-del').hidden = meta.role !== 'owner';
+  $('v-edit').onclick = () => openEdit(id);
+  $('v-del').onclick = async () => { $('modal').hidden = true; await appendOp('NOTE_DELETE', { noteId: id }); };
+}
+function openEdit(id) {
+  editingId = id;
+  const n = id ? notes.find((x) => x.id === id) : null;
+  $('modal').hidden = false; $('m-view').hidden = true; $('m-edit').hidden = false;
+  $('e-title').value = n?.title ?? '';
+  $('e-content').value = n?.content ?? '';
+  pendingImage = n?.image ?? null;
+  renderPendingImg();
+  $('e-title').focus();
+}
+function renderPendingImg() {
+  $('e-img').innerHTML = '';
+  if (!pendingImage) return;
+  const img = document.createElement('img'); img.src = pendingImage; img.style.maxWidth = '100%';
+  const rm = document.createElement('button'); rm.className = 'ghost'; rm.textContent = 'quitar imagen';
+  rm.onclick = () => { pendingImage = null; renderPendingImg(); };
+  $('e-img').append(img, rm);
+}
+$('v-close').onclick = () => ($('modal').hidden = true);
+$('e-cancel').onclick = () => ($('modal').hidden = true);
+$('add').onclick = () => openEdit(null);
+$('e-save').onclick = async () => {
+  const title = $('e-title').value.trim(), content = $('e-content').value;
+  if (!title && !content && !pendingImage) return;
+  $('modal').hidden = true;
+  const data = { title, content, image: pendingImage };
+  const payload = { noteId: editingId ?? crypto.randomUUID(), enc: await Security.encrypt(data) };
+  await appendOp(editingId ? 'NOTE_EDIT' : 'NOTE_ADD', payload);
+};
+$('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true; };
+
+// pegar imágenes: ⌘V / Ctrl+V en el editor (el texto pega nativo)
+$('e-content').addEventListener('paste', async (e) => {
+  const item = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith('image/'));
+  if (!item) return; // texto → comportamiento nativo intacto
+  e.preventDefault();
+  const file = item.getAsFile();
+  pendingImage = await resizeImage(file, 900);
+  renderPendingImg();
+});
+function resizeImage(file, max) {
+  return new Promise((res) => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      res(c.toDataURL('image/jpeg', 0.82));
+      URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+/* ---------- spotlight (⌘F / Ctrl+F / ⌘K) ---------- */
+let spotSel = 0, spotHits = [];
+function openSpot() { $('spot').hidden = false; $('spot-q').value = ''; spotSearch(''); $('spot-q').focus(); }
+function closeSpot() { $('spot').hidden = true; }
+function spotSearch(q) {
+  q = q.toLowerCase();
+  spotHits = q ? notes.filter((n) => (n.title ?? '').toLowerCase().includes(q) || (n.content ?? '').toLowerCase().includes(q)) : [...notes];
+  spotSel = 0;
+  const ul = $('spot-res'); ul.innerHTML = '';
+  spotHits.slice(0, 8).forEach((n, i) => {
+    const li = document.createElement('li');
+    if (i === spotSel) li.classList.add('sel');
+    const b = document.createElement('b'); b.textContent = n.title || '(sin título)';
+    const s = document.createElement('small'); s.textContent = (n.content ?? '').slice(0, 70);
+    li.append(b, s);
+    li.onclick = () => spotGo(n.id);
+    ul.append(li);
+  });
+}
+function spotGo(id) { closeSpot(); Brain.focus(id); flashCard(id); }
+function flashCard(id) {
+  const el = cardEls.get(id); if (!el) return;
+  el.classList.add('hit');
+  setTimeout(() => el.classList.remove('hit'), 2200);
+}
+$('spot-q').oninput = (e) => spotSearch(e.target.value);
+addEventListener('keydown', (e) => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && (e.key === 'f' || e.key === 'k')) { e.preventDefault(); openSpot(); return; }
+  if (mod && e.code === 'Space') { e.preventDefault(); openSpot(); return; } // si el SO no lo captura antes
+  if ($('spot').hidden) return;
+  if (e.key === 'Escape') closeSpot();
+  else if (e.key === 'ArrowDown') { spotSel = Math.min(spotSel + 1, Math.min(spotHits.length, 8) - 1); spotSearch($('spot-q').value); paintSel(); }
+  else if (e.key === 'ArrowUp') { spotSel = Math.max(spotSel - 1, 0); paintSel(); }
+  else if (e.key === 'Enter' && spotHits[spotSel]) spotGo(spotHits[spotSel].id);
+});
+function paintSel() { [...$('spot-res').children].forEach((li, i) => li.classList.toggle('sel', i === spotSel)); }
+$('spot').onclick = (e) => { if (e.target === $('spot')) closeSpot(); };
+
+/* ---------- compartir ---------- */
+$('share').onclick = () => {
+  const code = `${meta.chainId}.${meta.encKey}`;
+  const link = location.protocol.startsWith('http') ? `${location.origin}${location.pathname}#${code}` : code;
+  navigator.clipboard.writeText(link);
+  log('enlace secreto copiado — compártelo SOLO con tus dispositivos');
+};
+
+/* ---------- arranque ---------- */
+async function enterMain() {
+  $('setup').hidden = true;
+  await Security.importKey(meta.encKey);
+  await rebuildNotes();
+  Brain.setNotes(notes);
+  await refresh();
+  startP2P();
+}
+$('btn-create').onclick = async () => {
+  const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
+  const publicKeyHex = bytesHex(await crypto.subtle.exportKey('raw', kp.publicKey));
+  const encKey = Security.newKeyHex();
+  meta = { role: 'owner', publicKeyHex, privateKey: kp.privateKey, encKey, chainId: '' };
+  const partial = { index: 0, prevHash: GENESIS_PREV, timestamp: Date.now(), type: 'GENESIS', payload: { ownerPubKey: publicKeyHex } };
+  const hash = await hashBlock(partial);
+  const signature = bytesHex(await crypto.subtle.sign('Ed25519', kp.privateKey, enc(hash)));
+  const genesis = { ...partial, hash, signature };
+  meta.chainId = hash;
+  blocks = [genesis];
+  await dbWrite((tx) => { tx.objectStore('blocks').put(genesis); tx.objectStore('meta').put(meta, 'meta'); });
+  log('cerebro creado y cifrado — eres el owner');
+  enterMain();
+};
+$('btn-join').onclick = async () => {
+  const raw = $('join-code').value.trim();
+  const m = raw.match(/([0-9a-f]{64})\.([0-9a-f]{64})/i);
+  if (!m) return log('código inválido — pide al owner su "enlace secreto"');
+  meta = { role: 'reader', chainId: m[1].toLowerCase(), encKey: m[2].toLowerCase() };
+  await dbWrite((tx) => tx.objectStore('meta').put(meta, 'meta'));
+  log('buscando el cerebro en la red…');
+  enterMain();
+};
+(async () => {
+  meta = await dbGet('meta', 'meta');
+  if (meta) { blocks = await dbAll(); enterMain(); return; }
+  const m = location.hash.slice(1).match(/([0-9a-f]{64})\.([0-9a-f]{64})/i);
+  if (m) { $('join-code').value = m[0]; history.replaceState(null, '', location.pathname); $('btn-join').click(); }
+})();
+
+/* ============================================================
+   CEREBRO 3D — la interfaz. Núcleo central + una rama por nota.
+   Rotación con mouse/trackpad, zoom con rueda. Pulsos eléctricos
+   viajan del centro a las neuronas. Tinta negra sobre blanco.
+   ============================================================ */
+const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
+(async () => {
+  let T;
+  try { T = await import('https://unpkg.com/three@0.170.0/build/three.module.js'); }
+  catch { log('sin conexión para three.js — vista simple'); simpleFallback(); return; }
+
+  const canvas = $('brain');
+  const renderer = new T.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const scene = new T.Scene();
+  const camera = new T.PerspectiveCamera(50, 1, 0.1, 100);
+
+  // órbita manual: esféricas + inercia
+  let theta = 0.6, phi = 1.25, radius = 6.2, vTheta = 0, vPhi = 0;
+  let targetTheta = null, targetPhi = null; // animación de focus
+  function placeCamera() {
+    camera.position.set(radius * Math.sin(phi) * Math.sin(theta), radius * Math.cos(phi), radius * Math.sin(phi) * Math.cos(theta));
+    camera.lookAt(0, 0, 0);
+  }
+  let dragging = false, px = 0, py = 0;
+  canvas.addEventListener('pointerdown', (e) => { dragging = true; px = e.clientX; py = e.clientY; canvas.classList.add('dragging'); targetTheta = targetPhi = null; });
+  addEventListener('pointerup', () => { dragging = false; canvas.classList.remove('dragging'); });
+  addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    vTheta = (e.clientX - px) * 0.006; vPhi = (e.clientY - py) * 0.006;
+    theta -= vTheta; phi = Math.min(2.6, Math.max(0.5, phi - vPhi));
+    px = e.clientX; py = e.clientY;
+  });
+  canvas.addEventListener('wheel', (e) => { e.preventDefault(); radius = Math.min(11, Math.max(3.2, radius + e.deltaY * 0.005)); }, { passive: false });
+
+  // núcleo: nube de puntos elipsoidal (el "cerebro" central)
+  const CORE = 360;
+  const corePos = new Float32Array(CORE * 3);
+  for (let i = 0; i < CORE; i++) {
+    let x, y, z;
+    do { x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1; } while (x * x + y * y + z * z > 1);
+    corePos.set([x * 1.05 + Math.sign(x) * 0.18, y * 0.8, z * 0.7], i * 3);
+  }
+  const coreGeo = new T.BufferGeometry();
+  coreGeo.setAttribute('position', new T.BufferAttribute(corePos, 3));
+  const ink = 0x000000;
+  scene.add(new T.Points(coreGeo, new T.PointsMaterial({ color: ink, size: 0.03, transparent: true, opacity: 0.75 })));
+  // conexiones internas del núcleo
+  const cLines = [];
+  for (let i = 0; i < CORE; i += 3) {
+    const j = (i + 7) % CORE;
+    cLines.push(...corePos.slice(i * 3, i * 3 + 3), ...corePos.slice(j * 3, j * 3 + 3));
+  }
+  const clGeo = new T.BufferGeometry();
+  clGeo.setAttribute('position', new T.BufferAttribute(new Float32Array(cLines), 3));
+  const coreLineMat = new T.LineBasicMaterial({ color: ink, transparent: true, opacity: 0.06 });
+  scene.add(new T.LineSegments(clGeo, coreLineMat));
+
+  // ramas por nota
+  const group = new T.Group();
+  scene.add(group);
+  let branches = []; // {id, curve, tip(Vector3), line, node}
+  const nodeMat = new T.PointsMaterial({ color: ink, size: 0.09 });
+  const branchMat = new T.LineBasicMaterial({ color: ink, transparent: true, opacity: 0.35 });
+
+  function buildBranches(list) {
+    for (const b of branches) { group.remove(b.line); group.remove(b.node); }
+    branches = [];
+    const N = list.length;
+    list.forEach((note, i) => {
+      // distribución fibonacci en esfera → ramas repartidas uniformes
+      const gr = (1 + Math.sqrt(5)) / 2;
+      const th = (2 * Math.PI * i) / gr;
+      const ph = Math.acos(1 - (2 * (i + 0.5)) / Math.max(N, 1));
+      const dir = new T.Vector3(Math.sin(ph) * Math.cos(th), Math.cos(ph) * 0.85, Math.sin(ph) * Math.sin(th)).normalize();
+      const tip = dir.clone().multiplyScalar(2.5 + (i % 3) * 0.35);
+      const mid = dir.clone().multiplyScalar(1.4).add(new T.Vector3((Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 0.7));
+      const curve = new T.QuadraticBezierCurve3(dir.clone().multiplyScalar(0.9), mid, tip);
+      const pts = curve.getPoints(24);
+      const lgeo = new T.BufferGeometry().setFromPoints(pts);
+      const line = new T.Line(lgeo, branchMat);
+      const ngeo = new T.BufferGeometry().setFromPoints([tip]);
+      const node = new T.Points(ngeo, nodeMat);
+      group.add(line, node);
+      branches.push({ id: note.id, curve, tip });
+    });
+    rebuildSparks();
+  }
+
+  // electricidad: chispas viajando del núcleo a cada neurona
+  let sparkGeo = null, sparkPts = null, sparks = [];
+  const sparkMat = new T.PointsMaterial({ color: ink, size: 0.055, transparent: true, opacity: 0.9 });
+  function rebuildSparks() {
+    if (sparkPts) scene.remove(sparkPts);
+    sparks = [];
+    const per = branches.length ? Math.max(1, Math.floor(26 / branches.length)) : 0;
+    for (const b of branches) for (let k = 0; k < per; k++) sparks.push({ curve: b.curve, t: Math.random(), v: 0.004 + Math.random() * 0.008 });
+    sparkGeo = new T.BufferGeometry();
+    sparkGeo.setAttribute('position', new T.BufferAttribute(new Float32Array(Math.max(sparks.length, 1) * 3), 3));
+    sparkPts = new T.Points(sparkGeo, sparkMat);
+    scene.add(sparkPts);
+  }
+
+  let pulseEnergy = 0;
+  Brain.pulse = () => { pulseEnergy = 1; };
+  Brain.setNotes = (list) => { buildBranches(list); syncCards(); };
+  Brain.focus = (id) => {
+    const b = branches.find((x) => x.id === id); if (!b) return;
+    const p = b.tip;
+    targetTheta = Math.atan2(p.x, p.z);
+    targetPhi = Math.acos(Math.min(1, Math.max(-1, p.y / p.length() * 0.85)));
+  };
+
+  function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+  addEventListener('resize', resize); resize();
+
+  const v = new T.Vector3();
+  function projectCards() {
+    for (const b of branches) {
+      const el = cardEls.get(b.id); if (!el) continue;
+      v.copy(b.tip).applyMatrix4(group.matrixWorld).project(camera);
+      const behind = v.z > 1;
+      const x = (v.x * 0.5 + 0.5) * innerWidth, y = (-v.y * 0.5 + 0.5) * innerHeight;
+      el.style.left = `${x}px`; el.style.top = `${y}px`;
+      el.style.opacity = behind ? 0 : Math.max(0.25, 1.15 - v.z * 0.9).toFixed(2);
+      el.style.pointerEvents = behind ? 'none' : 'auto';
+      el.style.zIndex = behind ? 1 : Math.round((1 - v.z) * 100) + 2;
+    }
+  }
+
+  const clock = new T.Clock();
+  (function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+    if (!dragging) {
+      if (targetTheta !== null) { // animación hacia la neurona buscada
+        theta += (targetTheta - theta) * 0.08;
+        phi += (targetPhi - phi) * 0.08;
+        if (Math.abs(targetTheta - theta) < 0.01 && Math.abs(targetPhi - phi) < 0.01) targetTheta = targetPhi = null;
+      } else {
+        theta += 0.0012; // deriva lenta
+        theta += vTheta * -1 * 0.0; // (inercia simple ya aplicada en drag)
+      }
+    }
+    placeCamera();
+    // chispas
+    if (sparks.length) {
+      const arr = sparkGeo.attributes.position.array;
+      sparks.forEach((s, i) => {
+        s.t += s.v * (1 + pulseEnergy * 2.5);
+        if (s.t > 1) s.t = 0;
+        const p = s.curve.getPoint(s.t);
+        arr[i * 3] = p.x; arr[i * 3 + 1] = p.y; arr[i * 3 + 2] = p.z;
+      });
+      sparkGeo.attributes.position.needsUpdate = true;
+      sparkMat.opacity = 0.55 + Math.sin(t * 6) * 0.2 + pulseEnergy * 0.25;
+    }
+    coreLineMat.opacity = 0.05 + Math.sin(t * 1.7) * 0.02 + pulseEnergy * 0.2;
+    if (pulseEnergy > 0) pulseEnergy = Math.max(0, pulseEnergy - 0.015);
+    renderer.render(scene, camera);
+    projectCards();
+  })();
+
+  function simpleFallback() {} // three cargó: no-op
+})();
+
+// fallback sin three.js: lista plana de cards en grid
+function simpleFallback() {
+  Brain.setNotes = () => {
+    syncCards();
+    let y = 90;
+    for (const [, el] of cardEls) { el.style.left = '50%'; el.style.top = `${y}px`; el.style.opacity = 1; y += 120; }
+  };
+}
+</script>
+</body>
+</html>
