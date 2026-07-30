@@ -704,6 +704,8 @@ function resizeImage(file, max) {
 // ⌘V / Ctrl+V FUERA del editor → crea la nota directamente (texto o imagen)
 const noteFromText = (text) => ({ title: text.trim().split('\n')[0].slice(0, 48), content: text, image: null });
 async function createNote(data) {
+  // jamás crear neuronas vacías (pegados fallidos, portapapeles raro)
+  if (!data.title?.trim() && !data.content?.trim() && !data.image) return log('nada que pegar — nota no creada');
   await appendOp('NOTE_ADD', { noteId: crypto.randomUUID(), enc: await Security.encrypt(data) });
   log('nota creada — nueva neurona');
 }
@@ -863,8 +865,9 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   const camera = new T.PerspectiveCamera(50, 1, 0.1, 100);
 
   // órbita manual: esféricas + inercia
-  let theta = 0.6, phi = 1.25, radius = 6.2, vTheta = 0, vPhi = 0;
+  let theta = 0.6, phi = 1.25, radius = 4.6, vTheta = 0, vPhi = 0;
   let targetTheta = null, targetPhi = null; // animación de focus
+  let calmUntil = 0; // deriva pausada hasta este timestamp (tras buscar/interactuar)
   function placeCamera() {
     camera.position.set(radius * Math.sin(phi) * Math.sin(theta), radius * Math.cos(phi), radius * Math.sin(phi) * Math.cos(theta));
     camera.lookAt(0, 0, 0);
@@ -873,7 +876,7 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   let dragging = false, px = 0, py = 0;
   const touchPts = new Map();
   let pinchBase = 0, radiusBase = 0;
-  const clampR = (r) => Math.min(11, Math.max(3.2, r));
+  const clampR = (r) => Math.min(9, Math.max(2.4, r));
   canvas.addEventListener('pointerdown', (e) => {
     touchPts.set(e.pointerId, [e.clientX, e.clientY]);
     if (touchPts.size === 1) { dragging = true; px = e.clientX; py = e.clientY; canvas.classList.add('dragging'); targetTheta = targetPhi = null; }
@@ -886,6 +889,7 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   });
   const endPointer = (e) => {
     touchPts.delete(e.pointerId);
+    calmUntil = Date.now() + 2000; // respiro antes de retomar la deriva
     if (touchPts.size === 1) { const p = [...touchPts.values()][0]; px = p[0]; py = p[1]; dragging = true; }
     else { dragging = false; canvas.classList.remove('dragging'); }
   };
@@ -911,14 +915,21 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   const ink = 0x000000;
   const coreGroup = new T.Group();
   scene.add(coreGroup);
-  const CORE = 420;
+  // puntos sobre la SUPERFICIE de un elipsoide con circunvoluciones (arrugas),
+  // surco interhemisférico y base aplanada — silueta de cerebro wireframe
+  const CORE = 520;
   const corePos = new Float32Array(CORE * 3);
   const corePts = [];
   for (let i = 0; i < CORE; i++) {
-    let x, y, z;
-    do { x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1; } while (x * x + y * y + z * z > 1);
-    // dos hemisferios con surco central + achatado: silueta de cerebro
-    const p = new T.Vector3((x * 0.62 + Math.sign(x) * 0.10) * 1.15, y * 0.5 + 0.04 * Math.sin(x * 6), z * 0.42);
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(Math.random() * 2 - 1);
+    const d = new T.Vector3(Math.sin(ph) * Math.cos(th), Math.cos(ph), Math.sin(ph) * Math.sin(th));
+    // arrugas: radio modulado por ondas (los pliegues de la corteza)
+    const r = 0.5 * (1 + 0.08 * Math.sin(th * 5) * Math.sin(ph * 4) + 0.05 * Math.sin(th * 9 + 1.3));
+    const p = new T.Vector3(d.x * r * 1.35, d.y * r * 0.95, d.z * r * 1.1);
+    p.x += Math.sign(p.x) * 0.045; // surco entre hemisferios
+    if (Math.abs(d.x) < 0.12) p.y *= 0.82; // el surco se hunde arriba
+    if (p.y < -0.26) p.y = -0.26 + (p.y + 0.26) * 0.35; // base plana (tronco)
     corePos.set([p.x, p.y, p.z], i * 3);
     corePts.push(p);
   }
@@ -958,9 +969,10 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
       const th = (2 * Math.PI * i) / gr;
       const ph = Math.acos(1 - (2 * (i + 0.5)) / Math.max(N, 1));
       const dir = new T.Vector3(Math.sin(ph) * Math.cos(th), Math.cos(ph) * 0.85, Math.sin(ph) * Math.sin(th)).normalize();
-      const tip = dir.clone().multiplyScalar(2.5 + (i % 3) * 0.35);
-      const mid = dir.clone().multiplyScalar(1.4).add(new T.Vector3((Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 0.7));
-      const curve = new T.QuadraticBezierCurve3(dir.clone().multiplyScalar(0.72), mid, tip); // nace en la superficie del mini cerebro
+      // ramas cortas: las notas orbitan pegadas al cerebro, no en el espacio
+      const tip = dir.clone().multiplyScalar(1.45 + (i % 3) * 0.18);
+      const mid = dir.clone().multiplyScalar(1.05).add(new T.Vector3((Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4));
+      const curve = new T.QuadraticBezierCurve3(dir.clone().multiplyScalar(0.72), mid, tip); // nace en la superficie del cerebro
       const pts = curve.getPoints(24);
       const lgeo = new T.BufferGeometry().setFromPoints(pts);
       const line = new T.Line(lgeo, branchMat);
@@ -1019,12 +1031,18 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {} };
   (function animate() {
     requestAnimationFrame(animate);
     const t = clock.getElapsedTime();
-    if (!dragging && targetTheta !== null) { // animación hacia la neurona buscada
-      theta += (targetTheta - theta) * 0.08;
-      phi += (targetPhi - phi) * 0.08;
-      if (Math.abs(targetTheta - theta) < 0.01 && Math.abs(targetPhi - phi) < 0.01) targetTheta = targetPhi = null;
+    if (!dragging) {
+      if (targetTheta !== null) { // animación hacia la neurona buscada
+        theta += (targetTheta - theta) * 0.08;
+        phi += (targetPhi - phi) * 0.08;
+        if (Math.abs(targetTheta - theta) < 0.01 && Math.abs(targetPhi - phi) < 0.01) {
+          targetTheta = targetPhi = null;
+          calmUntil = Date.now() + 2500; // quieto un momento sobre la nota encontrada
+        }
+      } else if (Date.now() > calmUntil && $('spot').hidden && $('modal').hidden) {
+        theta += 0.0012; // deriva de siempre — pausada al buscar, leer o tras tocar
+      }
     }
-    // sin deriva automática: el cerebro solo se mueve cuando TÚ lo mueves
     placeCamera();
     coreGroup.rotation.y = t * 0.55; // el mini cerebro gira solo, continuo
     // chispas
