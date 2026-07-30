@@ -191,6 +191,7 @@
   <span>sinapsis <b id="peers">0</b></span>
   <span id="net">—</span>
   <button id="share" class="ghost" hidden>enlace secreto</button>
+  <button id="netoggle" class="ghost" hidden>desconectar</button>
   <button id="forget" class="ghost" hidden>salir</button>
 </div>
 
@@ -450,12 +451,32 @@ async function startP2P() {
   let tick = 0;
   setInterval(() => { tick++; if (!peers.size || tick % 6 === 0) sockets.forEach(announce); }, 8_000);
 }
+let p2pDown = false; // kill switch: cerebro aislado, sin red
 function trackerConnect(url) {
+  if (p2pDown) return;
   let ws; try { ws = new WebSocket(url); } catch { return; }
   ws.onopen = () => { sockets.push(ws); announce(ws); updateNet(); };
-  ws.onclose = () => { sockets = sockets.filter((s) => s !== ws); updateNet(); setTimeout(() => trackerConnect(url), 30_000); };
+  ws.onclose = () => { sockets = sockets.filter((s) => s !== ws); updateNet(); if (!p2pDown) setTimeout(() => trackerConnect(url), 30_000); };
   ws.onerror = () => ws.close();
   ws.onmessage = (ev) => { try { onTracker(ws, JSON.parse(ev.data)); } catch {} };
+}
+
+// corta TODO: sinapsis, trackers y ofertas pendientes. El cerebro queda
+// aislado (solo lectura/escritura local) hasta reconectar.
+function stopP2P() {
+  p2pDown = true;
+  for (const [, p] of peers) { try { p.dc.close(); p.pc.close(); } catch {} }
+  peers.clear();
+  for (const ws of sockets) { try { ws.close(); } catch {} }
+  sockets = [];
+  cleanPending(0);
+  document.querySelectorAll('[data-chip]').forEach((e) => e.remove());
+  refresh();
+}
+function resumeP2P() {
+  p2pDown = false;
+  TRACKERS.forEach(trackerConnect);
+  refresh();
 }
 function cleanPending(maxAgeMs = 90_000) {
   const now = Date.now();
@@ -464,7 +485,7 @@ function cleanPending(maxAgeMs = 90_000) {
   }
 }
 async function announce(ws) {
-  if (ws.readyState !== WebSocket.OPEN) return;
+  if (p2pDown || ws.readyState !== WebSocket.OPEN) return;
   cleanPending(); // ofertas viejas no consumidas → cerrar (evita fugar PeerConnections)
   // Con sinapsis activa NO ofrecemos: un dispositivo nuevo siempre trae sus
   // propias ofertas y nosotros respondemos. Ofrecer estando emparejado creaba
@@ -585,9 +606,11 @@ setInterval(() => {
 /* ---------- UI: estado y cards ---------- */
 function updateNet() {
   // nº de trackers visible: diagnóstico clave — si marca 0, la red bloquea la señalización
-  $('net').textContent = peers.size
-    ? 'sincronizado p2p · cifrado'
-    : sockets.length ? `buscando peers… (${sockets.length} trackers)` : 'offline · réplica local';
+  $('net').textContent = p2pDown
+    ? 'desconectado · cerebro aislado'
+    : peers.size
+      ? 'sincronizado p2p · cifrado'
+      : sockets.length ? `buscando peers… (${sockets.length} trackers)` : 'offline · réplica local';
 }
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); }
@@ -597,7 +620,9 @@ async function refresh(dataChanged) {
   $('add').hidden = $('paste').hidden = meta.role !== 'owner';
   $('find').hidden = false;
   $('share').hidden = false;
+  $('netoggle').hidden = false;
   $('forget').hidden = false;
+  $('forget').textContent = meta.role === 'owner' ? 'eliminar cerebro' : 'salir';
   updateNet();
 }
 
@@ -816,13 +841,29 @@ $('share').onclick = () => {
   log('enlace secreto copiado — compártelo SOLO con tus dispositivos');
 };
 
-// salir: borra réplica local, llaves y config de ESTE dispositivo.
-// (No borra nada en los demás — en P2P cada dispositivo es dueño de su copia.)
+// desconectar/conectar: kill switch de red — corta todas las sinapsis y
+// deja de anunciarse. Las notas siguen usables en local.
+$('netoggle').onclick = () => {
+  if (p2pDown) {
+    resumeP2P();
+    $('netoggle').textContent = 'desconectar';
+    log('reconectando a la red…');
+  } else {
+    stopP2P();
+    $('netoggle').textContent = 'conectar';
+    log('desconectado — cerebro aislado, nadie puede sincronizar contigo');
+  }
+};
+
+// eliminar cerebro (owner) / salir (lector): corta conexiones y borra réplica,
+// llaves y config de ESTE dispositivo. En P2P no se puede borrar a distancia:
+// cada dispositivo es dueño de su copia.
 $('forget').onclick = async () => {
   const msg = meta?.role === 'owner'
-    ? '¿Olvidar este cerebro AQUÍ? Eres el OWNER: si ningún otro dispositivo tiene réplica, las notas se pierden para siempre. ¿Continuar?'
+    ? '¿ELIMINAR este cerebro? Se cierran todas las conexiones y se borra todo aquí (notas, llaves, enlace). Si ningún otro dispositivo tiene réplica, se pierde PARA SIEMPRE. ¿Continuar?'
     : '¿Olvidar este cerebro en este dispositivo? Se borra la réplica y la llave. Necesitarás el enlace secreto para volver.';
   if (!confirm(msg)) return;
+  stopP2P();
   await new Promise((res) => { const r = indexedDB.deleteDatabase('noteschain-v2'); r.onsuccess = res; r.onerror = res; r.onblocked = res; });
   location.reload();
 };
