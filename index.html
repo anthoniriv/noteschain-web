@@ -534,15 +534,31 @@ async function encryptBytes(buf) {
 const decryptBytes = ({ iv, ct }) =>
   crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, Security.aesKey, ct);
 
+// qué blobs tenemos ya, consultable en SÍNCRONO: las cards necesitan saberlo
+// para repintarse en cuanto un archivo llega (si no, el "recibiendo…" se queda pegado)
+const blobReady = new Set();
+
 async function putBlob(hash, rec) {
   memBlobs.set(hash, rec);
+  blobReady.add(hash);
   if (PERSIST) await dbWrite((tx) => tx.objectStore('blobs').put({ hash, iv: rec.iv, ct: rec.ct }));
 }
 async function getBlobRec(hash) {
   if (memBlobs.has(hash)) return memBlobs.get(hash);
   const rec = await dbGet('blobs', hash).catch(() => null);
-  if (rec) memBlobs.set(hash, { iv: rec.iv, ct: rec.ct });
+  if (rec) { memBlobs.set(hash, { iv: rec.iv, ct: rec.ct }); blobReady.add(hash); }
   return rec ? { iv: rec.iv, ct: rec.ct } : null;
+}
+
+// precarga el estado de disponibilidad de los archivos de las notas y repinta
+// si algo cambió (al arrancar los blobs están en disco pero no en memoria)
+async function syncBlobAvailability() {
+  let changed = false;
+  for (const f of notesFiles()) {
+    if (blobReady.has(f.hash)) continue;
+    if (await hasBlob(f.hash)) changed = true;
+  }
+  if (changed) syncCards();
 }
 const hasBlob = async (hash) => Boolean(await getBlobRec(hash));
 
@@ -979,6 +995,7 @@ const renderAll = () => { syncCards(); if (!$('modal').hidden && viewingId) open
 
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); requestMissingBlobs(); }
+  syncBlobAvailability(); // también al arrancar: los blobs están en disco pero no en memoria
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
   $('role').textContent = meta.role === 'owner' ? 'owner' : 'lector';
@@ -1007,16 +1024,25 @@ function syncCards() {
       el._sig = null;
     }
     const files = n.files ?? [];
-    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${files.map((f) => f.hash).join()}|${n.updatedAt}`;
+    // el sig incluye si cada archivo ya llegó: así la card se repinta sola
+    // cuando termina la descarga, sin tener que tocar la nota
+    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${files.map((f) => f.hash + (blobReady.has(f.hash) ? '+' : '-')).join()}|${n.updatedAt}`;
     if (el._sig !== sig) {
       el._sig = sig;
       el.innerHTML = '';
       const img = files.find(isImage);
-      if (n.image || img) {
+      if (n.image) {
         const im = document.createElement('img');
-        if (n.image) im.src = n.image;
-        else blobUrl(img).then((u) => { if (u) im.src = u; else im.replaceWith(pendingBox()); });
+        im.src = n.image;
         el.append(im);
+      } else if (img) {
+        if (blobReady.has(img.hash)) {
+          const im = document.createElement('img');
+          blobUrl(img).then((u) => { if (u) im.src = u; });
+          el.append(im);
+        } else {
+          el.append(pendingBox()); // llegará y el sig cambiará → repinta solo
+        }
       }
       const h = document.createElement('h4'); h.textContent = n.title || '(sin título)'; el.append(h);
       const txt = stripCode(n.content ?? '');
@@ -1698,6 +1724,7 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {}, explode: (
   // el cerebro cargó DESPUÉS de enterMain: dibujar las notas que ya existían
   // (sin esto, tras un hard refresh no se veía nada hasta el siguiente cambio)
   Brain.setNotes(notes);
+  syncBlobAvailability(); // y sus imágenes, si ya están en disco
 })();
 
 // fallback sin three.js: lista plana de cards en grid
