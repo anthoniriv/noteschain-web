@@ -96,6 +96,15 @@
     will-change: left, top, opacity;
   }
   .ncard:hover { box-shadow: 4px 4px 0 var(--ink); }
+  /* neurona en la cara trasera del cerebro: atenuada y algo más pequeña,
+     para que se lea la profundidad en vez de flotar encima de todo */
+  .ncard.behind {
+    opacity: .22;
+    filter: blur(.4px);
+    box-shadow: none;
+    border-color: var(--line);
+  }
+  .ncard.behind:hover { opacity: .5; }
   .ncard h4 { font-size: .62rem; letter-spacing: .06em; text-transform: uppercase; margin-bottom: .25rem;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ncard p { font-size: .58rem; color: var(--dim); line-height: 1.45; max-height: 2.9em; overflow: hidden; word-break: break-word; }
@@ -353,7 +362,7 @@
       <input id="e-title" placeholder="título" />
       <textarea id="e-content" placeholder="escribe o pega tu nota… (⌘V / Ctrl+V — también imágenes)" rows="8"></textarea>
       <div id="e-img"></div>
-      <p id="paste-hint">⌘V / Ctrl+V pega texto, imágenes o archivos. También puedes arrastrarlos aquí. Para código usa ```lenguaje … ``` — todo se cifra antes de salir del dispositivo. Máximo 60 MB por archivo.</p>
+      <p id="paste-hint">⌘V / Ctrl+V pega texto, imágenes o archivos. También puedes arrastrarlos aquí. Para código usa ```lenguaje … ``` — todo se cifra antes de salir del dispositivo. Sin límite fijo de tamaño: se cifra y envía por fragmentos (lo limita el espacio del dispositivo).</p>
       <input type="file" id="e-file" multiple hidden />
       <!-- accept de galería: en iOS/Android abre fotos y vídeos con selección múltiple -->
       <input type="file" id="e-media" multiple accept="image/*,video/*" hidden />
@@ -685,7 +694,11 @@ const dbWrite = async (fn) => {
    (que se rompe con mensajes grandes) nunca se atraganta.
    Cada blob se guarda CIFRADO y se verifica por el hash de su contenido claro.
    ============================================================ */
-const MAX_FILE = 60 * 1024 * 1024; // 60 MB por archivo (vídeos cortos incluidos)
+// Sin techo de memoria: el archivo se cifra y se guarda por fragmentos, así
+// que solo un fragmento está en RAM a la vez. El límite real es el espacio del
+// dispositivo (se comprueba antes de aceptar).
+const MAX_FILE = 2 * 1024 * 1024 * 1024; // 2 GB
+const FRAG = 256 * 1024; // unidad de cifrado, guardado, petición y reanudación
 // 16 KB de ciphertext → ~21 KB de mensaje en base64. Con 48 KB el mensaje
 // rondaba los 64 KB y Safari/iOS los descarta en silencio (los archivos del
 // iPhone nunca llegaban).
@@ -723,12 +736,40 @@ async function getBlobRec(hash) {
 async function syncBlobAvailability() {
   let changed = false;
   for (const f of notesFiles()) {
-    if (blobReady.has(f.hash)) continue;
-    if (await hasBlob(f.hash)) changed = true;
+    for (const h of partsOf(f)) {
+      if (blobReady.has(h)) continue;
+      if (await hasBlob(h)) changed = true;
+    }
   }
   if (changed) syncCards();
 }
 const hasBlob = async (hash) => Boolean(await getBlobRec(hash));
+
+/* Un archivo = lista de fragmentos direccionados por hash. Cada fragmento se
+   cifra y se guarda por separado, así que:
+   · la memoria nunca sube más de un fragmento (adiós al límite por RAM);
+   · una transferencia interrumpida se reanuda por donde iba;
+   · se pueden pedir fragmentos distintos a peers distintos (multi-fuente);
+   · fragmentos idénticos entre archivos se guardan una sola vez.        */
+async function ingestFileStreaming(file) {
+  const fragHashes = [];
+  const total = Math.max(1, Math.ceil(file.size / FRAG));
+  for (let i = 0; i < total; i++) {
+    const buf = await file.slice(i * FRAG, (i + 1) * FRAG).arrayBuffer();
+    const h = await bufHashHex(buf);
+    fragHashes.push(h);
+    if (!(await hasBlob(h))) await putBlob(h, await encryptBytes(buf));
+    if (total > 4 && i % 4 === 0) log(`cifrando ${file.name}… ${Math.round(((i + 1) / total) * 100)}%`);
+  }
+  const hash = await sha256Hex(fragHashes.join('')); // identidad del archivo completo
+  return {
+    name: file.name || 'archivo',
+    type: file.type || 'application/octet-stream',
+    size: file.size,
+    hash,
+    frags: fragHashes,
+  };
+}
 
 // Archivo del usuario → blob cifrado + descriptor para la nota
 async function ingestFile(file) {
@@ -745,10 +786,7 @@ async function ingestFile(file) {
     }
   } catch {}
   try {
-    const buf = await file.arrayBuffer();
-    const hash = await bufHashHex(buf);
-    if (!(await hasBlob(hash))) await putBlob(hash, await encryptBytes(buf));
-    return { name: file.name || 'archivo', type: file.type || 'application/octet-stream', size: file.size, hash };
+    return await ingestFileStreaming(file);
   } catch (e) {
     // sin espacio en el navegador, o el archivo no cabe en memoria
     const sinEspacio = /quota|storage|space/i.test(e?.name + e?.message);
@@ -759,15 +797,28 @@ async function ingestFile(file) {
   }
 }
 
-// URL utilizable (blob:) para mostrar o descargar; null si aún no llegó
+// piezas que componen un archivo (formato nuevo: fragmentos; antiguo: una sola)
+const partsOf = (f) => (f.frags?.length ? f.frags : [f.hash]);
+const fileReady = (f) => partsOf(f).every((h) => blobReady.has(h));
+const fileProgress = (f) => {
+  const parts = partsOf(f);
+  return parts.filter((h) => blobReady.has(h)).length / parts.length;
+};
+
+// URL utilizable (blob:) para mostrar o descargar; null si aún no está entero.
+// El Blob se compone de los fragmentos descifrados: el navegador lo respalda
+// en disco, así que un vídeo de 1 GB no se carga en memoria.
 const urlCache = new Map();
 async function blobUrl(f) {
   if (urlCache.has(f.hash)) return urlCache.get(f.hash);
-  const rec = await getBlobRec(f.hash);
-  if (!rec) return null;
   try {
-    const plain = await decryptBytes(rec);
-    const url = URL.createObjectURL(new Blob([plain], { type: f.type }));
+    const parts = [];
+    for (const h of partsOf(f)) {
+      const rec = await getBlobRec(h);
+      if (!rec) return null; // aún falta algún fragmento
+      parts.push(await decryptBytes(rec));
+    }
+    const url = URL.createObjectURL(new Blob(parts, { type: f.type }));
     urlCache.set(f.hash, url);
     return url;
   } catch { return null; }
@@ -1005,17 +1056,28 @@ const STALL_MS = 25_000;
 // Pide los archivos que las notas referencian y no tengo. Reintenta: antes,
 // si la petición se perdía (peer suspendido, canal muerto) el archivo se
 // quedaba "recibiendo…" para siempre.
+const MAX_PARALLEL = 6; // fragmentos en vuelo a la vez
+
+// Pide los fragmentos que faltan REPARTIÉNDOLOS entre las sinapsis: con dos
+// dispositivos que ya tienen el archivo, se descarga al doble de velocidad.
 async function requestMissingBlobs() {
   const dcs = [...peers.values()].filter((p) => p.dc?.readyState === 'open').map((p) => p.dc);
   if (!dcs.length) return;
   const now = Date.now();
+  let inFlight = incoming.size;
+  let turn = 0;
   for (const f of notesFiles()) {
-    if (await hasBlob(f.hash)) { asking.delete(f.hash); continue; }
-    if (incoming.has(f.hash)) continue; // ya está llegando
-    if (now - (asking.get(f.hash) ?? 0) < ASK_RETRY) continue;
-    asking.set(f.hash, now);
-    // a todas las sinapsis: el que lo tenga responde, el que no dice BLOB_MISS
-    for (const dc of dcs) { try { dc.send(JSON.stringify({ t: 'GET_BLOB', hash: f.hash })); } catch {} }
+    for (const h of partsOf(f)) {
+      if (inFlight >= MAX_PARALLEL) return;
+      if (blobReady.has(h) || (await hasBlob(h))) { asking.delete(h); continue; }
+      if (incoming.has(h)) continue; // ya viene en camino
+      if (now - (asking.get(h) ?? 0) < ASK_RETRY) continue;
+      asking.set(h, now);
+      inFlight++;
+      // a un peer distinto por fragmento (rota); si no lo tiene responde BLOB_MISS
+      const dc = dcs[turn++ % dcs.length];
+      try { dc.send(JSON.stringify({ t: 'GET_BLOB', hash: h })); } catch {}
+    }
   }
 }
 
@@ -1065,7 +1127,8 @@ async function onBlobChunk(m) {
     await putBlob(m.hash, rec);
     asking.delete(m.hash);
     urlCache.delete(m.hash);
-    toast('Archivo recibido y verificado.');
+    requestMissingBlobs(); // pedir ya el siguiente: mantener la tubería llena
+    if (notesFiles().some((f) => fileReady(f) && partsOf(f).includes(m.hash))) toast('Archivo recibido y verificado.');
     renderAll();
   } catch { fail('Archivo descartado: no se pudo descifrar con la llave de este cerebro.'); }
 }
@@ -1362,7 +1425,7 @@ function syncCards() {
     const files = n.files ?? [];
     // el sig incluye si cada archivo ya llegó: así la card se repinta sola
     // cuando termina la descarga, sin tener que tocar la nota
-    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${files.map((f) => f.hash + (blobReady.has(f.hash) ? '+' : '-')).join()}|${n.updatedAt}`;
+    const sig = `${n.title}|${(n.content ?? '').length}|${n.image ? 1 : 0}|${files.map((f) => f.hash + (fileReady(f) ? '+' : Math.round(fileProgress(f) * 10))).join()}|${n.updatedAt}`;
     if (el._sig !== sig) {
       el._sig = sig;
       el.innerHTML = '';
@@ -1372,12 +1435,15 @@ function syncCards() {
         im.src = n.image;
         el.append(im);
       } else if (img) {
-        if (blobReady.has(img.hash)) {
+        if (fileReady(img)) {
           const im = document.createElement('img');
           blobUrl(img).then((u) => { if (u) im.src = u; });
           el.append(im);
         } else {
-          el.append(pendingBox()); // llegará y el sig cambiará → repinta solo
+          const box = pendingBox();
+          const pct = Math.round(fileProgress(img) * 100);
+          if (pct > 0) box.textContent = `⏳ recibiendo imagen… ${pct}%`;
+          el.append(box); // al completarse cambia el sig y se repinta solo
         }
       }
       const h = document.createElement('h4'); h.textContent = n.title || '(sin título)'; el.append(h);
@@ -1391,7 +1457,8 @@ function syncCards() {
       for (const f of files.filter((x) => !isImage(x))) {
         const row = document.createElement('div');
         row.className = 'fchip';
-        row.textContent = `▤ ${f.name} · ${prettySize(f.size)}`;
+        const pct = Math.round(fileProgress(f) * 100);
+        row.textContent = pct === 100 ? `▤ ${f.name} · ${prettySize(f.size)}` : `⏳ ${f.name} · ${pct}%`;
         el.append(row);
       }
       if (hasCode(n.content ?? '')) {
@@ -1474,7 +1541,7 @@ async function openView(id) {
   if (n.image) { const img = document.createElement('img'); img.src = n.image; box.append(img); }
   for (const f of n.files ?? []) {
     const url = await blobUrl(f);
-    if (!url) { const p = pendingBox(); p.textContent = `⏳ ${f.name} — recibiendo…`; box.append(p); continue; }
+    if (!url) { const p = pendingBox(); p.textContent = `⏳ ${f.name} — recibiendo ${Math.round(fileProgress(f) * 100)}%`; box.append(p); continue; }
     if (isImage(f)) { const img = document.createElement('img'); img.src = url; box.append(img); }
     else if ((f.type || '').startsWith('video/')) { const v = document.createElement('video'); v.src = url; v.controls = true; v.style.maxWidth = '100%'; box.append(v); }
     else if ((f.type || '').startsWith('audio/')) { const a2 = document.createElement('audio'); a2.src = url; a2.controls = true; a2.style.width = '100%'; box.append(a2); }
@@ -1898,14 +1965,16 @@ addEventListener('beforeunload', (e) => {
 addEventListener('pagehide', () => {
   try {
     if (meta && !dying && !tombstone && isOwner() && blocks.length) {
-      // el traspaso va pre-firmado: aquí solo queda enviarlo (síncrono)
+      // el traspaso va pre-firmado: aquí solo queda enviarlo (síncrono).
+      // Si resulta ser una recarga, al volver seré dispositivo con mis notas
+      // intactas y el heredero ya tendrá la custodia: nada se pierde.
       if (readyTransfer) {
         const msg = JSON.stringify({ t: 'NEW_BLOCK', block: readyTransfer });
         for (const p of peers.values()) { try { p.dc.send(msg); } catch {} }
       }
-      // la copia del owner no sobrevive al cierre (efimeridad pura)
-      localStorage.setItem('nc_purge', '1'); // por si el borrado no da tiempo
-      indexedDB.deleteDatabase('noteschain-v2');
+      // La copia del owner no sobrevive al cierre, pero una RECARGA no es un
+      // cierre: se marca la intención y al abrir se comprueba de qué fue.
+      localStorage.setItem('nc_purge', String(Date.now()));
     }
     stopP2P();
   } catch {}
@@ -1985,11 +2054,14 @@ $('btn-join').onclick = async () => {
   enterMain();
 };
 (async () => {
-  // el owner cerró la pestaña: su copia no sobrevive (custodia viva)
+  // ¿el owner cerró de verdad, o solo recargó? Recargar no debe destruir nada.
   if (localStorage.getItem('nc_purge')) {
     localStorage.removeItem('nc_purge');
-    await wipeIdb();
-    toast('Cerraste como owner: esta copia se borró y la custodia pasó a otro dispositivo (si había alguno despierto).', true, 9000);
+    const nav = performance.getEntriesByType('navigation')[0];
+    if (nav?.type !== 'reload') {
+      await wipeIdb();
+      toast('Cerraste como owner: esta copia se borró y la custodia pasó a otro dispositivo (si había alguno despierto).', true, 9000);
+    }
   }
   // lápida guardada: seguir difundiendo la sentencia tras recargar/reabrir
   const tomb = await dbGet('meta', 'tombstone');
@@ -2207,16 +2279,26 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {}, explode: (
   addEventListener('resize', resize); resize();
 
   const v = new T.Vector3();
+  const world = new T.Vector3();
+  const CORE_R = 0.75; // radio aproximado del cerebro, para saber qué tapa qué
   function projectCards() {
+    const camDist = camera.position.length(); // el cerebro está en el origen
     for (const b of branches) {
       const el = cardEls.get(b.id); if (!el) continue;
-      v.copy(b.tip).applyMatrix4(group.matrixWorld).project(camera);
-      const behind = v.z > 1;
+      world.copy(b.tip).applyMatrix4(group.matrixWorld);
+      v.copy(world).project(camera);
+      const offscreen = v.z > 1;
+      // ¿la neurona está por detrás del cerebro visto desde la cámara?
+      const dist = world.distanceTo(camera.position);
+      const lateral = Math.hypot(v.x, v.y) * camDist * 0.5; // cuánto se aparta del centro
+      const occluded = dist > camDist && lateral < CORE_R * 1.35;
       const x = (v.x * 0.5 + 0.5) * innerWidth, y = (-v.y * 0.5 + 0.5) * innerHeight;
       el.style.left = `${x}px`; el.style.top = `${y}px`;
-      el.style.opacity = behind ? 0 : 1; // cards siempre sólidas
-      el.style.pointerEvents = behind ? 'none' : 'auto';
-      el.style.zIndex = behind ? 1 : Math.round((1 - v.z) * 100) + 2;
+      el.style.opacity = offscreen ? 0 : '';
+      el.classList.toggle('behind', occluded && !offscreen);
+      el.style.pointerEvents = offscreen ? 'none' : 'auto';
+      // las de delante siempre por encima de las de detrás
+      el.style.zIndex = offscreen ? 1 : Math.round((2 - v.z) * 100) + (occluded ? 0 : 200);
     }
   }
 
