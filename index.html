@@ -23,7 +23,7 @@
 
   /* ---- barra superior mínima ---- */
   #topbar {
-    position: fixed; top: 0; left: 0; right: 0; z-index: 5;
+    position: fixed; top: 0; left: 0; right: 0; z-index: 80;
     display: flex; align-items: center; gap: 1.2rem;
     padding: .9rem 1.2rem;
     font-size: .65rem; letter-spacing: .12em; text-transform: uppercase;
@@ -56,7 +56,7 @@
 
   /* ---- setup ---- */
   #setup {
-    position: fixed; inset: 0; z-index: 10;
+    position: fixed; inset: 0; z-index: 100;
     display: flex; flex-direction: column; justify-content: center; align-items: center;
     background: rgba(255,255,255,.82); backdrop-filter: blur(6px);
     padding: 1rem;
@@ -72,7 +72,7 @@
 
   /* aviso de cerebro muerto */
   #dead {
-    position: fixed; inset: 0; z-index: 40;
+    position: fixed; inset: 0; z-index: 150;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 1rem; text-align: center; padding: 2rem;
     background: rgba(255,255,255,.9); backdrop-filter: blur(4px);
@@ -113,7 +113,7 @@
 
   /* ---- modal nota ---- */
   #modal {
-    position: fixed; inset: 0; z-index: 20;
+    position: fixed; inset: 0; z-index: 110;
     display: flex; align-items: center; justify-content: center;
     background: rgba(255,255,255,.75); backdrop-filter: blur(8px);
   }
@@ -154,7 +154,7 @@
   .ncard .fchip { font-size: .55rem; }
   body.dropping::after {
     content: 'suelta para adjuntar';
-    position: fixed; inset: .6rem; z-index: 60;
+    position: fixed; inset: .6rem; z-index: 165;
     border: 2px dashed var(--ink);
     display: flex; align-items: center; justify-content: center;
     font-size: .7rem; letter-spacing: .2em; text-transform: uppercase;
@@ -166,7 +166,7 @@
 
   /* ---- panel de dispositivos ---- */
   #devs {
-    position: fixed; inset: 0; z-index: 45;
+    position: fixed; inset: 0; z-index: 120;
     display: flex; align-items: center; justify-content: center;
     background: rgba(255,255,255,.7); backdrop-filter: blur(8px); padding: 1rem;
   }
@@ -188,7 +188,7 @@
 
   /* ---- diálogo propio (sustituye a confirm() nativo) ---- */
   #ask {
-    position: fixed; inset: 0; z-index: 50;
+    position: fixed; inset: 0; z-index: 130;
     display: flex; align-items: center; justify-content: center;
     background: rgba(255,255,255,.7); backdrop-filter: blur(8px);
     padding: 1rem;
@@ -209,7 +209,7 @@
 
   /* ---- spotlight ---- */
   #spot {
-    position: fixed; inset: 0; z-index: 30;
+    position: fixed; inset: 0; z-index: 140;
     display: flex; flex-direction: column; align-items: center;
     padding-top: 18vh;
     background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
@@ -235,7 +235,7 @@
 
   /* chips de estado de dispositivos */
   #chips {
-    position: fixed; top: 3.2rem; right: 1.2rem; z-index: 5;
+    position: fixed; top: 3.2rem; right: 1.2rem; z-index: 80;
     display: flex; flex-direction: column; gap: .4rem; align-items: flex-end;
   }
   .chip {
@@ -252,7 +252,7 @@
   @keyframes dotpulse { 0%,100% { opacity: .15; } 50% { opacity: 1; } }
 
   .fab {
-    position: fixed; right: 1.4rem; z-index: 5;
+    position: fixed; right: 1.4rem; z-index: 80;
     width: 3rem; height: 3rem; font-size: 1.3rem; padding: 0;
     border-radius: 50%;
   }
@@ -272,7 +272,7 @@
   /* avisos: legibles y en pantalla, no una línea cortada abajo */
   #toasts {
     position: fixed; top: 3.4rem; left: 50%; transform: translateX(-50%);
-    z-index: 70; width: min(420px, 92vw);
+    z-index: 160; width: min(420px, 92vw);
     display: flex; flex-direction: column; gap: .4rem;
     pointer-events: none;
   }
@@ -301,7 +301,7 @@
   .shaking { animation: shake .5s cubic-bezier(.36,.07,.19,.97) both; }
 
   #log {
-    position: fixed; left: 1rem; bottom: 1rem; z-index: 4;
+    position: fixed; left: 1rem; bottom: 1rem; z-index: 70;
     font-size: .6rem; color: var(--dim); max-width: 80vw;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     pointer-events: none;
@@ -893,7 +893,9 @@ async function receiveBlock(block, from) {
   const owner = blocks[0]?.payload.ownerPubKey;
   if (blocks[block.index]?.hash === block.hash) return; // ya lo tenemos (eco de gossip)
   if (!owner || !tip || block.index !== tip.index + 1) return from?.send(JSON.stringify({ t: 'GET_BLOCKS' }));
-  const err = await verifyBlock(block, tip, owner, writersOf(blocks));
+  // la autoridad vigente puede no ser la del génesis (hubo sucesión): sin
+  // pasarla, los bloques del nuevo owner se rechazaban por "no es el owner"
+  const err = await verifyBlock(block, tip, owner, writersOf(blocks), authorityOf(blocks));
   if (err) return fail(`Bloque rechazado: ${err}`);
   blocks.push(block);
   await dbWrite((tx) => tx.objectStore('blocks').put(block));
@@ -2297,8 +2299,9 @@ const Brain = { setNotes: () => {}, pulse: () => {}, focus: () => {}, explode: (
       el.style.opacity = offscreen ? 0 : '';
       el.classList.toggle('behind', occluded && !offscreen);
       el.style.pointerEvents = offscreen ? 'none' : 'auto';
-      // las de delante siempre por encima de las de detrás
-      el.style.zIndex = offscreen ? 1 : Math.round((2 - v.z) * 100) + (occluded ? 0 : 200);
+      // profundidad entre cards, pero SIEMPRE por debajo de modales (z 20+):
+      // con valores altos las notas se dibujaban encima de las ventanas
+      el.style.zIndex = offscreen ? 1 : (occluded ? 2 : 32) + Math.round((1 - Math.min(1, Math.max(0, v.z))) * 25);
     }
   }
 
