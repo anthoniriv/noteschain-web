@@ -403,7 +403,8 @@
 <div id="devs" hidden>
   <div class="sheet">
     <h3 id="devs-title">dispositivos</h3>
-    <p class="hint">Estos dispositivos pueden crear y editar notas. Al revocar uno deja de poder escribir; su copia de lo ya sincronizado sigue en su equipo (en P2P no hay borrado a distancia salvo eliminar el cerebro).</p>
+    <p class="hint">Quién forma el cerebro y quién tiene la custodia (★). Si el dispositivo con la custodia se va, la asume el sucesor nº 1; puedes cambiar ese orden. Al revocar, el dispositivo deja de poder escribir, aunque conserva lo que ya sincronizó.</p>
+    <p class="hint" id="devs-heir" hidden></p>
     <ul id="devs-list"></ul>
     <div class="row"><button id="devs-close" class="ghost">cerrar</button></div>
   </div>
@@ -1509,15 +1510,30 @@ function updateNet() {
 }
 const renderAll = () => { syncCards(); if (!$('modal').hidden && viewingId) openView(viewingId); };
 
+// avisar cuando la custodia cambia de manos (a mí o a otro dispositivo)
+let lastKnownOwner = null;
+function announceCustodyChange() {
+  if (!blocks.length) return;
+  const owner = authorityOf(blocks).owner;
+  if (lastKnownOwner === null) { lastKnownOwner = owner; return; } // primer arranque
+  if (owner === lastKnownOwner) return;
+  lastKnownOwner = owner;
+  if (owner === myPub()) toast('★ Este dispositivo tiene ahora la custodia del cerebro.', false, 7000);
+  else toast(`La custodia pasó a ${nameFor(owner)}.`, false, 6000);
+  if (!$('devs').hidden) paintDevices();
+}
+
 async function refresh(dataChanged) {
   if (dataChanged) { await rebuildNotes(); Brain.setNotes(notes); Brain.pulse(); requestMissingBlobs(); }
   syncBlobAvailability(); // también al arrancar: los blobs están en disco pero no en memoria
   paintTransfer();
   const write = canWrite();
+  registerMyName();
+  announceCustodyChange();
   $('height').textContent = notes.length; // neuronas = notas visibles, no bloques internos
   $('peers').textContent = peers.size;
   $('role').textContent = isOwner()
-    ? 'owner'
+    ? '★ custodia'
     : meta.device
       ? (write ? 'mi dispositivo' : wasRevoked(meta.publicKeyHex) ? 'escritura revocada' : 'esperando permiso')
       : 'invitado';
@@ -1916,6 +1932,7 @@ function deviceLabel() {
   return 'Dispositivo';
 }
 const deviceNames = new Map(); // pubKey → nombre legible (llega en el saludo)
+const registerMyName = () => { const p = myPub(); if (p) deviceNames.set(p, deviceLabel()); };
 const nameFor = (pub) => {
   const short = pub.slice(0, 4);
   const base = deviceNames.get(pub);
@@ -1923,14 +1940,18 @@ const nameFor = (pub) => {
   return `${base ?? 'dispositivo'} ${short}${mine}`;
 };
 
-// testamento: los dispositivos autorizados, en orden de antigüedad
-async function updateSuccession() {
+// testamento: a quién pasa la custodia y en qué orden. Se mantiene solo al
+// autorizar o revocar, y el owner puede reordenarlo a mano desde el panel.
+async function updateSuccession(order) {
   if (!isOwner() || !blocks.length) return;
   const { owner, heirs } = authorityOf(blocks);
-  const current = [...writersOf(blocks)].filter((p) => p !== owner);
-  if (JSON.stringify(current) === JSON.stringify(heirs)) return; // sin cambios
-  await appendOp('SUCCESSION', { heirs: current });
+  const writers = [...writersOf(blocks)].filter((p) => p !== owner);
+  // se respeta el orden elegido antes; los nuevos van al final
+  const base = order ?? [...heirs.filter((h) => writers.includes(h)), ...writers.filter((w) => !heirs.includes(w))];
+  if (JSON.stringify(base) === JSON.stringify(heirs)) return; // sin cambios
+  await appendOp('SUCCESSION', { heirs: base });
 }
+const heirRank = (pub) => authorityOf(blocks).heirs.indexOf(pub);
 
 // bloque de traspaso listo para enviarse en el instante del cierre (firmar
 // entonces sería demasiado tarde: el navegador no espera a operaciones async)
@@ -1961,7 +1982,7 @@ async function maybeClaimOwnership() {
   const firstAlive = heirs.find((h) => h === myPub() || onlinePubs.has(h));
   if (firstAlive !== myPub()) return;
   await appendOp('OWNER_CLAIM', { pubKey: myPub() });
-  toast('Este dispositivo asume la custodia: el owner anterior desapareció.');
+  toast('El dispositivo con la custodia desapareció: la asumo yo.', false, 7000);
   await refresh(true);
 }
 
@@ -1993,6 +2014,15 @@ function paintDevices() {
   ul.innerHTML = '';
   const owner = authorityOf(blocks).owner; // el owner VIGENTE, no el del génesis
   $('devs-title').textContent = isOwner() ? 'dispositivos autorizados' : 'dispositivos del cerebro';
+  // a quién pasaría la custodia si el owner actual se va
+  const heirNow = authorityOf(blocks).heirs.find((h) => onlinePubs.has(h) || h === myPub());
+  const hint = $('devs-heir');
+  hint.hidden = !heirNow;
+  if (heirNow) {
+    hint.textContent = isOwner()
+      ? `Si cierras ahora, la custodia pasará a ${nameFor(heirNow)}.`
+      : `Si el dispositivo con la custodia se va, la asumirá ${nameFor(heirNow)}.`;
+  }
   const list = [owner, ...[...writersOf(blocks)].filter((p) => p !== owner)].filter(Boolean);
   // solicitudes de dispositivos revocados que quieren volver
   for (const pub of authRequests) {
@@ -2032,13 +2062,28 @@ function paintDevices() {
     name.textContent = nameFor(pub);
     const st = document.createElement('span');
     st.className = 'st';
-    const quien = pub === owner ? 'custodia' : 'escritura';
+    const rank = heirRank(pub);
+    const quien = pub === owner ? '★ tiene la custodia' : rank === 0 ? 'sucesor nº 1' : rank > 0 ? `sucesor nº ${rank + 1}` : 'escritura';
     st.textContent = pub === myPub()
       ? `● este dispositivo · ${quien}`
       : `${onlinePubs.has(pub) ? '●' : '○'} ${onlinePubs.has(pub) ? 'en línea' : 'desconectado'} · ${quien}`;
     who.append(name, st);
     li.append(who);
-    if (!isOwner() || pub === myPub()) { ul.append(li); continue; } // solo el owner revoca
+    if (!isOwner() || pub === owner) { ul.append(li); continue; } // sobre uno mismo no se actúa
+    // elegir a mano quién hereda primero
+    if (heirRank(pub) !== 0) {
+      const up = document.createElement('button');
+      up.className = 'ghost';
+      up.textContent = 'heredar 1º';
+      up.title = 'este dispositivo tomará la custodia si me voy';
+      up.onclick = async () => {
+        const others = authorityOf(blocks).heirs.filter((h) => h !== pub);
+        await updateSuccession([pub, ...others]);
+        toast(`${nameFor(pub)} será quien herede la custodia.`);
+        paintDevices();
+      };
+      li.append(up);
+    }
     const rv = document.createElement('button');
     rv.className = 'ghost';
     rv.textContent = 'revocar';
