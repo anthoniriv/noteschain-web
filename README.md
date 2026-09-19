@@ -29,7 +29,7 @@ No requiere una cuenta ni usa un backend como almacén de notas. La infraestruct
 
 ## Probar ahora
 
-Abrí **[Selnote en GitHub Pages](https://anthoniriv.github.io/selnote-web/)** en un navegador moderno.
+Abrí **[Selnote en GitHub Pages](https://enderdev01.github.io/selnote-web/)** en un navegador moderno.
 
 1. Seleccioná **Crear cerebro**.
 2. Creá una nota con el botón **+** o pegá texto, imágenes o archivos.

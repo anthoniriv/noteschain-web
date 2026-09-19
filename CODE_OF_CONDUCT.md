@@ -12,4 +12,4 @@ Nos comprometemos a mantener una comunidad respetuosa, inclusiva y constructiva,
 
 ## Incumplimientos
 
-Reportá incidentes de forma privada al mantenedor [@anthoniriv](https://github.com/anthoniriv). Los reportes se tratarán con discreción y se evaluarán de forma proporcional.
+Reportá incidentes de forma privada al mantenedor [@enderdev01](https://github.com/enderdev01). Los reportes se tratarán con discreción y se evaluarán de forma proporcional.
